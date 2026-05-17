@@ -43,8 +43,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
+	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
-	_ "modernc.org/sqlite"
 )
 
 // ─── Configuration ────────────────────────────────────────────────────────────
@@ -115,12 +115,13 @@ func (sm *streamManager) start(key string, rtmpConn net.Conn, destinations []str
 // full RTMP re-ingest and keeps the pipeline inside one process tree.
 //
 // LL-HLS settings:
-//   -hls_time 1          → 1-second target segment duration
-//   -hls_list_size 6     → keep 6 segments in the manifest (≈6 s window)
-//   -hls_flags delete_segments+independent_segments+split_by_time+program_date_time
-//   -hls_segment_type fmp4  → fragmented MP4 partial segments
-//   -hls_fmp4_init_filename init.mp4
-//   -hls_flags +append_list → running playlist for low-latency
+//
+//	-hls_time 1          → 1-second target segment duration
+//	-hls_list_size 6     → keep 6 segments in the manifest (≈6 s window)
+//	-hls_flags delete_segments+independent_segments+split_by_time+program_date_time
+//	-hls_segment_type fmp4  → fragmented MP4 partial segments
+//	-hls_fmp4_init_filename init.mp4
+//	-hls_flags +append_list → running playlist for low-latency
 //
 // Audio-only path (radio): no video track, aac 192 k.
 // Video path: h264 baseline, aac 192 k.
@@ -145,9 +146,9 @@ func (sm *streamManager) transcode(ctx context.Context, key, outDir string, rtmp
 	if isRadio {
 		args = []string{
 			"-loglevel", "warning",
-			"-re",                     // read at native frame rate (live simulation)
-			"-i", "pipe:0",            // read RTMP data from stdin
-			"-vn",                     // drop video track
+			"-re",          // read at native frame rate (live simulation)
+			"-i", "pipe:0", // read RTMP data from stdin
+			"-vn", // drop video track
 			"-c:a", "aac",
 			"-b:a", "192k",
 			"-ar", "44100",
@@ -171,7 +172,7 @@ func (sm *streamManager) transcode(ctx context.Context, key, outDir string, rtmp
 			"-c:v", "libx264",
 			"-profile:v", "baseline",
 			"-level:v", "3.1",
-			"-preset", "veryfast",  // CPU efficiency on a VPS
+			"-preset", "veryfast", // CPU efficiency on a VPS
 			"-tune", "zerolatency", // minimize encoder latency
 			"-b:v", "2500k",
 			"-maxrate", "2500k",
@@ -447,11 +448,14 @@ var knownPlatforms = map[string]string{
 	"instagram": "rtmps://edgetee-upload.facebook.com:443/rtmp",
 }
 
-// initDB opens (or creates) the SQLite database and runs schema migrations.
-func initDB(path string) error {
+// initDB opens the PostgreSQL database and runs schema migrations.
+func initDB(dsn string) error {
 	var err error
-	db, err = sql.Open("sqlite", path)
+	db, err = sql.Open("postgres", dsn)
 	if err != nil {
+		return err
+	}
+	if err = db.Ping(); err != nil {
 		return err
 	}
 	_, err = db.Exec(`
@@ -461,7 +465,12 @@ func initDB(path string) error {
 			password_hash TEXT NOT NULL,
 			stream_key    TEXT UNIQUE NOT NULL,
 			created_at    TEXT NOT NULL
-		);
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS destinations (
 			id         TEXT PRIMARY KEY,
 			user_id    TEXT NOT NULL,
@@ -472,7 +481,7 @@ func initDB(path string) error {
 			updated_at TEXT NOT NULL,
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 			UNIQUE(user_id, platform)
-		);
+		)
 	`)
 	return err
 }
@@ -576,11 +585,11 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, err = db.Exec(
-		`INSERT INTO users (id, email, password_hash, stream_key, created_at) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO users (id, email, password_hash, stream_key, created_at) VALUES ($1, $2, $3, $4, $5)`,
 		userID, body.Email, string(hash), streamKey, time.Now().UTC().Format(time.RFC3339),
 	)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
 			http.Error(w, "email already registered", http.StatusConflict)
 			return
 		}
@@ -619,7 +628,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
 	var userID, passwordHash, streamKey string
 	err := db.QueryRow(
-		`SELECT id, password_hash, stream_key FROM users WHERE email = ?`, body.Email,
+		`SELECT id, password_hash, stream_key FROM users WHERE email = $1`, body.Email,
 	).Scan(&userID, &passwordHash, &streamKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
@@ -663,12 +672,12 @@ func handleStreamCredentials(w http.ResponseWriter, r *http.Request) {
 func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(contextKeyUserID).(string)
 	var streamKey string
-	if err := db.QueryRow(`SELECT stream_key FROM users WHERE id = ?`, userID).Scan(&streamKey); err != nil {
+	if err := db.QueryRow(`SELECT stream_key FROM users WHERE id = $1`, userID).Scan(&streamKey); err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
 	rows, err := db.Query(
-		`SELECT platform, rtmp_url, stream_key, enabled FROM destinations WHERE user_id = ? ORDER BY platform`,
+		`SELECT platform, rtmp_url, stream_key, enabled FROM destinations WHERE user_id = $1 ORDER BY platform`,
 		userID,
 	)
 	if err != nil {
@@ -697,10 +706,10 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"stream_key":        streamKey,
-		"rtmp_url":          rtmpIngestBase + "/" + streamKey,
-		"rtmp_ingest_base":  rtmpIngestBase,
-		"destinations":      dests,
+		"stream_key":       streamKey,
+		"rtmp_url":         rtmpIngestBase + "/" + streamKey,
+		"rtmp_ingest_base": rtmpIngestBase,
+		"destinations":     dests,
 	})
 }
 
@@ -738,11 +747,11 @@ func handleSaveCredentials(w http.ResponseWriter, r *http.Request) {
 		}
 		_, err := tx.Exec(`
 			INSERT INTO destinations (id, user_id, platform, rtmp_url, stream_key, enabled, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(user_id, platform) DO UPDATE SET
-				stream_key = excluded.stream_key,
-				enabled    = excluded.enabled,
-				updated_at = excluded.updated_at
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (user_id, platform) DO UPDATE SET
+				stream_key = EXCLUDED.stream_key,
+				enabled    = EXCLUDED.enabled,
+				updated_at = EXCLUDED.updated_at
 		`, id, userID, d.Platform, rtmpURL, strings.TrimSpace(d.StreamKey), enabled, time.Now().UTC().Format(time.RFC3339))
 		if err != nil {
 			log.Printf("[auth] save destinations error: %v", err)
@@ -768,7 +777,7 @@ func getDestinationsForKey(streamKey string) []string {
 		SELECT d.rtmp_url, d.stream_key
 		FROM destinations d
 		JOIN users u ON u.id = d.user_id
-		WHERE u.stream_key = ? AND d.enabled = 1 AND d.stream_key != ''
+		WHERE u.stream_key = $1 AND d.enabled = 1 AND d.stream_key != ''
 	`, streamKey)
 	if err != nil {
 		log.Printf("[db] destinations lookup error: %v", err)
@@ -959,14 +968,14 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 // set custom headers on WebSocket upgrade requests.
 
 type encoderConfig struct {
-	Action   string `json:"action"`   // "start" (default) | "stop"
+	Action   string `json:"action"` // "start" (default) | "stop"
 	Host     string `json:"host"`
 	Port     string `json:"port"`
 	Mount    string `json:"mount"`
 	Username string `json:"username"`
 	Password string `json:"password"`
-	Codec    string `json:"codec"`    // "mp3" | "aac"
-	Bitrate  string `json:"bitrate"`  // e.g. "192k"
+	Codec    string `json:"codec"`   // "mp3" | "aac"
+	Bitrate  string `json:"bitrate"` // e.g. "192k"
 }
 
 type encoderStatus struct {
@@ -1198,15 +1207,15 @@ func main() {
 
 	streams = newStreamManager()
 
-	// Initialize SQLite database.
-	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		dbPath = "./radioinonestop.db"
+	// Initialize PostgreSQL database.
+	dbDSN := os.Getenv("DATABASE_URL")
+	if dbDSN == "" {
+		log.Fatalf("[db] DATABASE_URL environment variable is required")
 	}
-	if err := initDB(dbPath); err != nil {
+	if err := initDB(dbDSN); err != nil {
 		log.Fatalf("[db] init error: %v", err)
 	}
-	log.Printf("[db] Database: %s", dbPath)
+	log.Printf("[db] Connected to PostgreSQL")
 
 	// JWT secret — use JWT_SECRET env var or generate ephemeral secret.
 	if secret := os.Getenv("JWT_SECRET"); secret != "" {
