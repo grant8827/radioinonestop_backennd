@@ -1071,6 +1071,17 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		codec = "mp3"
 	}
 
+	// ── Server-side Icecast target override ───────────────────────────────
+	// ICECAST_HOST / ICECAST_PORT env vars let the server admin pin the
+	// Icecast endpoint (e.g. Railway private networking) regardless of what
+	// the browser sends.  When unset the client-supplied values are used.
+	if h := os.Getenv("ICECAST_HOST"); h != "" {
+		cfg.Host = h
+	}
+	if p := os.Getenv("ICECAST_PORT"); p != "" {
+		cfg.Port = p
+	}
+
 	// ── Build icecast:// URL using net/url (safe, no shell injection) ──────
 	icecastURL := &url.URL{
 		Scheme: "icecast",
