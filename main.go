@@ -483,6 +483,20 @@ func initDB(dsn string) error {
 			UNIQUE(user_id, platform)
 		)
 	`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS stations (
+			id                      TEXT PRIMARY KEY,
+			user_id                 TEXT NOT NULL UNIQUE,
+			station_slug            TEXT NOT NULL UNIQUE,
+			is_live                 BOOLEAN NOT NULL DEFAULT false,
+			current_listeners_count INTEGER NOT NULL DEFAULT 0,
+			last_connected_at       TEXT,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)
+	`)
 	return err
 }
 
@@ -493,6 +507,144 @@ func generateKey() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// ─── Station hub (in-memory audio fan-out) ────────────────────────────────────
+
+// stationHub fans out raw WebM audio chunks from one broadcaster to N listeners.
+// The first received chunk (WebM initialization segment) is buffered so that
+// listeners who join mid-stream still get a valid stream header.
+type stationHub struct {
+	mu     sync.Mutex
+	subs   map[chan []byte]struct{}
+	header []byte      // first chunk (WebM EBML + segment header)
+	done   chan struct{} // closed when broadcaster disconnects
+}
+
+func newStationHub() *stationHub {
+	return &stationHub{
+		subs: make(map[chan []byte]struct{}),
+		done: make(chan struct{}),
+	}
+}
+
+func (h *stationHub) subscribe() chan []byte {
+	ch := make(chan []byte, 32) // ~8 s buffer at 250 ms chunks
+	h.mu.Lock()
+	if len(h.header) > 0 {
+		ch <- append([]byte(nil), h.header...)
+	}
+	h.subs[ch] = struct{}{}
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *stationHub) unsubscribe(ch chan []byte) {
+	h.mu.Lock()
+	delete(h.subs, ch)
+	h.mu.Unlock()
+}
+
+func (h *stationHub) broadcast(data []byte) {
+	h.mu.Lock()
+	if len(h.header) == 0 {
+		h.header = append([]byte(nil), data...)
+	}
+	cp := append([]byte(nil), data...)
+	for ch := range h.subs {
+		select {
+		case ch <- cp:
+		default: // slow listener — drop chunk rather than blocking the broadcaster
+		}
+	}
+	h.mu.Unlock()
+}
+
+var (
+	hubsMu sync.RWMutex
+	hubs   = make(map[string]*stationHub)
+)
+
+func getOrCreateHub(slug string) *stationHub {
+	hubsMu.Lock()
+	defer hubsMu.Unlock()
+	if h, ok := hubs[slug]; ok {
+		return h
+	}
+	h := newStationHub()
+	hubs[slug] = h
+	return h
+}
+
+// closeHub removes the hub from the registry and signals all listeners to exit.
+func closeHub(slug string, h *stationHub) {
+	hubsMu.Lock()
+	if hubs[slug] == h {
+		delete(hubs, slug)
+	}
+	hubsMu.Unlock()
+	close(h.done)
+}
+
+// ─── Station helpers ──────────────────────────────────────────────────────────
+
+// generateStationSlug derives a URL-safe slug from an email address prefix
+// and appends a 4-character random hex suffix for uniqueness.
+func generateStationSlug(email string) string {
+	at := strings.Index(email, "@")
+	prefix := email
+	if at > 0 {
+		prefix = email[:at]
+	}
+	var b strings.Builder
+	prevHyphen := false
+	for _, r := range strings.ToLower(prefix) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevHyphen = false
+		} else if !prevHyphen && b.Len() > 0 {
+			b.WriteRune('-')
+			prevHyphen = true
+		}
+	}
+	slug := strings.TrimSuffix(b.String(), "-")
+	if len(slug) > 20 {
+		slug = slug[:20]
+	}
+	if slug == "" {
+		slug = "station"
+	}
+	rb := make([]byte, 2)
+	rand.Read(rb) //nolint:errcheck
+	return slug + "-" + hex.EncodeToString(rb)
+}
+
+// ensureStation creates a station row for the user if one does not already exist.
+// It is idempotent and safe to call on every login / credential fetch.
+func ensureStation(userID, email string) (string, error) {
+	var slug string
+	err := db.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&slug)
+	if err == nil {
+		return slug, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	slug = generateStationSlug(email)
+	stationID, err := generateKey()
+	if err != nil {
+		return "", err
+	}
+	_, err = db.Exec(
+		`INSERT INTO stations (id, user_id, station_slug, is_live, current_listeners_count)
+		 VALUES ($1, $2, $3, false, 0)
+		 ON CONFLICT DO NOTHING`,
+		stationID, userID, slug,
+	)
+	if err != nil {
+		return "", err
+	}
+	return slug, nil
 }
 
 // jwtSign creates a signed JWT for the given user (30-day expiry).
@@ -602,12 +754,18 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	stationSlug, _ := ensureStation(userID, body.Email)
+	resp := map[string]string{
 		"token":      token,
 		"stream_key": streamKey,
 		"rtmp_url":   rtmpIngestBase + "/" + streamKey,
-	})
+	}
+	if stationSlug != "" {
+		resp["station_slug"] = stationSlug
+		resp["listen_url"] = "/listen/" + stationSlug
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleLogin authenticates an existing user and returns a fresh JWT.
@@ -647,12 +805,18 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	stationSlug, _ := ensureStation(userID, body.Email)
+	loginResp := map[string]string{
 		"token":      token,
 		"stream_key": streamKey,
 		"rtmp_url":   rtmpIngestBase + "/" + streamKey,
-	})
+	}
+	if stationSlug != "" {
+		loginResp["station_slug"] = stationSlug
+		loginResp["listen_url"] = "/listen/" + stationSlug
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(loginResp)
 }
 
 // handleStreamCredentials dispatches GET/PUT on /api/user/stream-credentials.
@@ -671,11 +835,15 @@ func handleStreamCredentials(w http.ResponseWriter, r *http.Request) {
 // and saved external platform destinations.
 func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(contextKeyUserID).(string)
+	email, _ := r.Context().Value(contextKeyEmail).(string)
 	var streamKey string
 	if err := db.QueryRow(`SELECT stream_key FROM users WHERE id = $1`, userID).Scan(&streamKey); err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
+	// Ensure a station row exists (idempotent — safe for existing users)
+	stationSlug, _ := ensureStation(userID, email)
+
 	rows, err := db.Query(
 		`SELECT platform, rtmp_url, stream_key, enabled FROM destinations WHERE user_id = $1 ORDER BY platform`,
 		userID,
@@ -704,13 +872,18 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 	if dests == nil {
 		dests = []destResp{}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	resp := map[string]interface{}{
 		"stream_key":       streamKey,
 		"rtmp_url":         rtmpIngestBase + "/" + streamKey,
 		"rtmp_ingest_base": rtmpIngestBase,
 		"destinations":     dests,
-	})
+	}
+	if stationSlug != "" {
+		resp["station_slug"] = stationSlug
+		resp["listen_url"] = "/listen/" + stationSlug
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleSaveCredentials upserts external platform stream keys for the current user.
@@ -983,6 +1156,118 @@ type encoderStatus struct {
 	Msg    string `json:"msg,omitempty"`
 }
 
+// handleBroadcast is the hub-mode branch of the encoder WebSocket.
+// The browser sends raw WebM audio chunks; the server fans them out to
+// all active /listen/{slug} HTTP clients for this station.
+func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), userID string) {
+	var stationSlug string
+	err := db.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&stationSlug)
+	if err != nil {
+		sendStatus("error", "no station found for your account — log out and back in")
+		return
+	}
+
+	db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1 WHERE user_id = $2`, //nolint:errcheck
+		time.Now().UTC().Format(time.RFC3339), userID)
+
+	h := getOrCreateHub(stationSlug)
+	sendStatus("live", "Broadcasting — listeners at /listen/"+stationSlug)
+	log.Printf("[hub/%s] broadcaster connected (user=%s)", stationSlug, userID)
+
+	defer func() {
+		closeHub(stationSlug, h)
+		db.Exec(`UPDATE stations SET is_live = false WHERE user_id = $1`, userID) //nolint:errcheck
+		log.Printf("[hub/%s] broadcaster disconnected", stationSlug)
+	}()
+
+	for {
+		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			return
+		}
+		if mt == websocket.TextMessage {
+			var ctrl encoderConfig
+			if json.Unmarshal(data, &ctrl) == nil && ctrl.Action == "stop" {
+				sendStatus("stopped", "")
+				return
+			}
+			continue
+		}
+		h.broadcast(data)
+	}
+}
+
+// handleListen streams live WebM audio from the station hub to an HTTP client.
+// GET /listen/{station_slug}
+func handleListen(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimPrefix(r.URL.Path, "/listen/")
+	slug = strings.Trim(slug, "/")
+	if slug == "" || strings.ContainsAny(slug, " \t\n\r/") {
+		http.Error(w, "invalid station id", http.StatusBadRequest)
+		return
+	}
+
+	// Verify station exists in DB
+	var isLive bool
+	err := db.QueryRow(`SELECT is_live FROM stations WHERE station_slug = $1`, slug).Scan(&isLive)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "station not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Get hub
+	hubsMu.RLock()
+	h, ok := hubs[slug]
+	hubsMu.RUnlock()
+	if !ok {
+		http.Error(w, "station is offline", http.StatusServiceUnavailable)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "audio/webm; codecs=opus")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ch := h.subscribe()
+	defer h.unsubscribe(ch)
+
+	db.Exec(`UPDATE stations SET current_listeners_count = current_listeners_count + 1 WHERE station_slug = $1`, slug) //nolint:errcheck
+	defer db.Exec(`UPDATE stations SET current_listeners_count = GREATEST(0, current_listeners_count - 1) WHERE station_slug = $1`, slug) //nolint:errcheck
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.done:
+			return
+		case data, ok := <-ch:
+			if !ok {
+				return
+			}
+			if _, err := w.Write(data); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
 func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	// ── Authenticate via JWT query param (browsers can't set WS headers) ──
 	tokenStr := r.URL.Query().Get("token")
@@ -1035,6 +1320,12 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cfg.Action == "stop" {
+		return
+	}
+
+	// ── Hub broadcast mode (no Icecast / FFmpeg required) ─────────────────
+	if cfg.Action == "broadcast" {
+		handleBroadcast(conn, sendStatus, claims.UserID)
 		return
 	}
 
@@ -1271,6 +1562,7 @@ func main() {
 	mux.HandleFunc("/api/auth/login", handleLogin)
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
 	mux.HandleFunc("/ws/encode", handleEncoderWS)
+	mux.HandleFunc("/listen/", handleListen)
 
 	// HLS static file handler (serves /hls/<streamKey>/index.m3u8 etc.)
 	mux.HandleFunc("/hls/", hlsHandler)
