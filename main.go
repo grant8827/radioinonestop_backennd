@@ -43,6 +43,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -491,13 +492,31 @@ func initDB(dsn string) error {
 			id                      TEXT PRIMARY KEY,
 			user_id                 TEXT NOT NULL UNIQUE,
 			station_slug            TEXT NOT NULL UNIQUE,
+			station_name            TEXT NOT NULL DEFAULT '',
+			logo_url                TEXT NOT NULL DEFAULT '',
 			is_live                 BOOLEAN NOT NULL DEFAULT false,
 			current_listeners_count INTEGER NOT NULL DEFAULT 0,
 			last_connected_at       TEXT,
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 		)
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Idempotent migrations for existing databases.
+	for _, migration := range []string{
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS station_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS logo_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS genre TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err = db.Exec(migration); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // generateKey returns a cryptographically random 32-character hex string.
@@ -588,17 +607,21 @@ func closeHub(slug string, h *stationHub) {
 
 // ─── Station helpers ──────────────────────────────────────────────────────────
 
-// generateStationSlug derives a URL-safe slug from an email address prefix
+// generateStationSlug derives a URL-safe slug from the station name
 // and appends a 4-character random hex suffix for uniqueness.
-func generateStationSlug(email string) string {
-	at := strings.Index(email, "@")
-	prefix := email
-	if at > 0 {
-		prefix = email[:at]
+// Falls back to the email prefix if stationName is empty.
+func generateStationSlug(stationName, email string) string {
+	source := stationName
+	if strings.TrimSpace(source) == "" {
+		at := strings.Index(email, "@")
+		source = email
+		if at > 0 {
+			source = email[:at]
+		}
 	}
 	var b strings.Builder
 	prevHyphen := false
-	for _, r := range strings.ToLower(prefix) {
+	for _, r := range strings.ToLower(source) {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
 			b.WriteRune(r)
 			prevHyphen = false
@@ -608,8 +631,8 @@ func generateStationSlug(email string) string {
 		}
 	}
 	slug := strings.TrimSuffix(b.String(), "-")
-	if len(slug) > 20 {
-		slug = slug[:20]
+	if len(slug) > 40 {
+		slug = slug[:40]
 	}
 	if slug == "" {
 		slug = "station"
@@ -621,7 +644,8 @@ func generateStationSlug(email string) string {
 
 // ensureStation creates a station row for the user if one does not already exist.
 // It is idempotent and safe to call on every login / credential fetch.
-func ensureStation(userID, email string) (string, error) {
+// stationName and logoURL are stored only on initial creation; pass "" on login paths.
+func ensureStation(userID, email, stationName, logoURL string) (string, error) {
 	var slug string
 	err := db.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&slug)
 	if err == nil {
@@ -630,16 +654,16 @@ func ensureStation(userID, email string) (string, error) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	slug = generateStationSlug(email)
+	slug = generateStationSlug(stationName, email)
 	stationID, err := generateKey()
 	if err != nil {
 		return "", err
 	}
 	_, err = db.Exec(
-		`INSERT INTO stations (id, user_id, station_slug, is_live, current_listeners_count)
-		 VALUES ($1, $2, $3, false, 0)
+		`INSERT INTO stations (id, user_id, station_slug, station_name, logo_url, is_live, current_listeners_count)
+		 VALUES ($1, $2, $3, $4, $5, false, 0)
 		 ON CONFLICT DO NOTHING`,
-		stationID, userID, slug,
+		stationID, userID, slug, stationName, logoURL,
 	)
 	if err != nil {
 		return "", err
@@ -698,23 +722,46 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // handleRegister creates a new user with an auto-generated stream key.
-// POST /api/auth/register  {"email": "...", "password": "..."}
+// POST /api/auth/register  {"email":"...","password":"...","first_name":"...","last_name":"...","station_name":"...","logo_url":"...","genre":"...","description":"..."}
 func handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var body struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email       string `json:"email"`
+		Password    string `json:"password"`
+		FirstName   string `json:"first_name"`
+		LastName    string `json:"last_name"`
+		StationName string `json:"station_name"`
+		LogoURL     string `json:"logo_url"`
+		Genre       string `json:"genre"`
+		Description string `json:"description"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+	body.FirstName = strings.TrimSpace(body.FirstName)
+	body.LastName = strings.TrimSpace(body.LastName)
+	body.StationName = strings.TrimSpace(body.StationName)
+	body.Genre = strings.TrimSpace(body.Genre)
+	body.Description = strings.TrimSpace(body.Description)
 	if _, err := mail.ParseAddress(body.Email); err != nil {
 		http.Error(w, "invalid email address", http.StatusBadRequest)
+		return
+	}
+	if body.FirstName == "" {
+		http.Error(w, "first name is required", http.StatusBadRequest)
+		return
+	}
+	if body.LastName == "" {
+		http.Error(w, "last name is required", http.StatusBadRequest)
+		return
+	}
+	if body.StationName == "" {
+		http.Error(w, "station name is required", http.StatusBadRequest)
 		return
 	}
 	if len(body.Password) < 8 {
@@ -737,8 +784,8 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, err = db.Exec(
-		`INSERT INTO users (id, email, password_hash, stream_key, created_at) VALUES ($1, $2, $3, $4, $5)`,
-		userID, body.Email, string(hash), streamKey, time.Now().UTC().Format(time.RFC3339),
+		`INSERT INTO users (id, email, password_hash, stream_key, first_name, last_name, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		userID, body.Email, string(hash), streamKey, body.FirstName, body.LastName, time.Now().UTC().Format(time.RFC3339),
 	)
 	if err != nil {
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
@@ -754,7 +801,14 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	stationSlug, _ := ensureStation(userID, body.Email)
+	stationSlug, _ := ensureStation(userID, body.Email, body.StationName, body.LogoURL)
+	// Store genre and description if station was created
+	if stationSlug != "" && (body.Genre != "" || body.Description != "") {
+		_, _ = db.Exec(
+			`UPDATE stations SET genre = $1, description = $2 WHERE user_id = $3`,
+			body.Genre, body.Description, userID,
+		)
+	}
 	resp := map[string]string{
 		"token":      token,
 		"stream_key": streamKey,
@@ -805,7 +859,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	stationSlug, _ := ensureStation(userID, body.Email)
+	stationSlug, _ := ensureStation(userID, body.Email, "", "")
 	loginResp := map[string]string{
 		"token":      token,
 		"stream_key": streamKey,
@@ -842,7 +896,7 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Ensure a station row exists (idempotent — safe for existing users)
-	stationSlug, _ := ensureStation(userID, email)
+	stationSlug, _ := ensureStation(userID, email, "", "")
 
 	rows, err := db.Query(
 		`SELECT platform, rtmp_url, stream_key, enabled FROM destinations WHERE user_id = $1 ORDER BY platform`,
@@ -1502,6 +1556,9 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 func main() {
+	// Load .env file if present (ignored in production where env vars are set externally)
+	_ = godotenv.Load()
+
 	// Ensure HLS output directory exists
 	if err := os.MkdirAll(HLSDir, 0755); err != nil {
 		log.Fatalf("Cannot create HLS dir: %v", err)
