@@ -1255,6 +1255,73 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 
 // handleListen streams live WebM audio from the station hub to an HTTP client.
 // GET /listen/{station_slug}
+
+// handleGetStations returns all registered stations (public).
+// GET /api/stations
+func handleGetStations(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description
+		FROM stations
+		ORDER BY is_live DESC, station_name ASC
+	`)
+	if err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	type Station struct {
+		Slug      string `json:"slug"`
+		Name      string `json:"name"`
+		LogoURL   string `json:"logo_url"`
+		IsLive    bool   `json:"is_live"`
+		Listeners int    `json:"listeners"`
+		Genre     string `json:"genre"`
+		Desc      string `json:"description"`
+	}
+	stations := []Station{}
+	for rows.Next() {
+		var s Station
+		if err := rows.Scan(&s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc); err != nil {
+			continue
+		}
+		stations = append(stations, s)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stations)
+}
+
+// handleGetStation returns a single station by slug (public).
+// GET /api/stations/{slug}
+func handleGetStation(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimPrefix(r.URL.Path, "/api/stations/")
+	slug = strings.Trim(slug, "/")
+	if slug == "" {
+		handleGetStations(w, r)
+		return
+	}
+	type Station struct {
+		Slug      string `json:"slug"`
+		Name      string `json:"name"`
+		LogoURL   string `json:"logo_url"`
+		IsLive    bool   `json:"is_live"`
+		Listeners int    `json:"listeners"`
+		Genre     string `json:"genre"`
+		Desc      string `json:"description"`
+	}
+	var s Station
+	err := db.QueryRow(`
+		SELECT station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description
+		FROM stations WHERE station_slug = $1
+	`, slug).Scan(&s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc)
+	if err != nil {
+		http.Error(w, `{"error":"station not found"}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s)
+}
+
+
 func handleListen(w http.ResponseWriter, r *http.Request) {
 	slug := strings.TrimPrefix(r.URL.Path, "/listen/")
 	slug = strings.Trim(slug, "/")
@@ -1618,6 +1685,8 @@ func main() {
 	mux.HandleFunc("/api/auth/register", handleRegister)
 	mux.HandleFunc("/api/auth/login", handleLogin)
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
+	mux.HandleFunc("/api/stations/", handleGetStation)
+	mux.HandleFunc("/api/stations", handleGetStations)
 	mux.HandleFunc("/ws/encode", handleEncoderWS)
 	mux.HandleFunc("/listen/", handleListen)
 
