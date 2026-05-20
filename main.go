@@ -45,6 +45,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/lib/pq"
+	"github.com/livekit/protocol/auth"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -1042,6 +1043,71 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// handleConferenceToken issues a short-lived LiveKit JWT so the browser
+// can join an audio conference room. No authentication required —
+// possession of the room link is the access control.
+func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	room := strings.TrimSpace(r.URL.Query().Get("room"))
+	username := strings.TrimSpace(r.URL.Query().Get("username"))
+
+	if room == "" || username == "" {
+		http.Error(w, "room and username are required", http.StatusBadRequest)
+		return
+	}
+	if len(room) > 64 || len(username) > 64 {
+		http.Error(w, "room and username must be \u2264 64 characters", http.StatusBadRequest)
+		return
+	}
+	// Restrict room to safe characters (UUID-like: hex + hyphens)
+	for _, c := range room {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+			http.Error(w, "invalid room id", http.StatusBadRequest)
+			return
+		}
+	}
+
+	apiKey := os.Getenv("LIVEKIT_API_KEY")
+	apiSecret := os.Getenv("LIVEKIT_API_SECRET")
+	livekitURL := os.Getenv("LIVEKIT_URL")
+
+	if apiKey == "" || apiSecret == "" || livekitURL == "" {
+		http.Error(w, "conference not configured on server", http.StatusServiceUnavailable)
+		return
+	}
+
+	canPublish := true
+	canSubscribe := true
+
+	at := auth.NewAccessToken(apiKey, apiSecret)
+	grant := &auth.VideoGrant{
+		RoomJoin:     true,
+		Room:         room,
+		CanPublish:   &canPublish,
+		CanSubscribe: &canSubscribe,
+	}
+	at.AddGrant(grant).
+		SetIdentity(username).
+		SetValidFor(2 * time.Hour)
+
+	token, err := at.ToJWT()
+	if err != nil {
+		log.Printf("[conference] token generation failed: %v", err)
+		http.Error(w, "failed to generate token", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"token": token,
+		"url":   livekitURL,
+	})
+}
+
 // handleConfig returns/updates station metadata.
 // It also computes the HLS URLs for radio and video streams dynamically
 // so the frontend always gets real, working playlist URLs.
@@ -1675,6 +1741,7 @@ func main() {
 
 	// HTTP routes
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/conference/token", handleConferenceToken)
 	mux.HandleFunc("/api/health", handleHealth)
 	mux.HandleFunc("/api/config", handleConfig)
 	mux.HandleFunc("/api/streams", handleStreams)
