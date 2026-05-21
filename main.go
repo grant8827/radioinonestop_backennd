@@ -609,22 +609,14 @@ func closeHub(slug string, h *stationHub) {
 
 // ─── Station helpers ──────────────────────────────────────────────────────────
 
-// generateStationSlug derives a URL-safe slug from the station name
-// and appends a 4-character random hex suffix for uniqueness.
-// Falls back to the email prefix if stationName is empty.
-func generateStationSlug(stationName, email string) string {
-	source := stationName
-	if strings.TrimSpace(source) == "" {
-		at := strings.Index(email, "@")
-		source = email
-		if at > 0 {
-			source = email[:at]
-		}
-	}
+// slugifyName converts a free-form name into a URL-safe slug component.
+// Allowed characters: a-z, 0-9, dot (.). Everything else collapses to a
+// single hyphen. Leading/trailing hyphens are stripped.
+func slugifyName(source string) string {
 	var b strings.Builder
 	prevHyphen := false
 	for _, r := range strings.ToLower(source) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' {
 			b.WriteRune(r)
 			prevHyphen = false
 		} else if !prevHyphen && b.Len() > 0 {
@@ -639,9 +631,24 @@ func generateStationSlug(stationName, email string) string {
 	if slug == "" {
 		slug = "station"
 	}
+	return slug
+}
+
+// generateStationSlug derives a URL-safe slug from the station name
+// and appends a 4-character random hex suffix for uniqueness.
+// Falls back to the email prefix if stationName is empty.
+func generateStationSlug(stationName, email string) string {
+	source := stationName
+	if strings.TrimSpace(source) == "" {
+		at := strings.Index(email, "@")
+		source = email
+		if at > 0 {
+			source = email[:at]
+		}
+	}
 	rb := make([]byte, 2)
 	rand.Read(rb) //nolint:errcheck
-	return slug + "-" + hex.EncodeToString(rb)
+	return slugifyName(source) + "-" + hex.EncodeToString(rb)
 }
 
 // ensureStation creates a station row for the user if one does not already exist.
@@ -936,21 +943,51 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
+		newStationName := strings.TrimSpace(body.StationName)
 		if _, err := db.Exec(
 			`UPDATE stations SET station_name = $1, genre = $2, description = $3, logo_url = $4 WHERE user_id = $5`,
-			strings.TrimSpace(body.StationName), body.Genre, strings.TrimSpace(body.Description), body.LogoURL, userID,
+			newStationName, body.Genre, strings.TrimSpace(body.Description), body.LogoURL, userID,
 		); err != nil {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
+
+		// Regenerate the station slug name-part from the new station name,
+		// preserving the existing random suffix so the URL structure stays consistent.
+		var listenURL string
+		if newStationName != "" {
+			var currentSlug string
+			if dbErr := db.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&currentSlug); dbErr == nil {
+				// Extract the existing 4-char hex suffix after the last hyphen
+				suffix := ""
+				if idx := strings.LastIndex(currentSlug, "-"); idx >= 0 {
+					suffix = currentSlug[idx+1:]
+				}
+				if suffix == "" {
+					rb := make([]byte, 2)
+					rand.Read(rb) //nolint:errcheck
+					suffix = hex.EncodeToString(rb)
+				}
+				newSlug := slugifyName(newStationName) + "-" + suffix
+				// Best-effort update; ignore collisions (slug stays the same on conflict)
+				_, _ = db.Exec(`UPDATE stations SET station_slug = $1 WHERE user_id = $2`, newSlug, userID)
+				listenURL = "/listen/" + newSlug
+			}
+		}
+		if listenURL == "" {
+			var slug string
+			_ = db.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&slug)
+			listenURL = "/listen/" + slug
+		}
+
 		// Issue a fresh token so the frontend picks up any name/email change immediately
-		token, err := jwtSign(userID, email, strings.TrimSpace(body.StationName))
+		token, err := jwtSign(userID, email, newStationName)
 		if err != nil {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"token": token})
+		json.NewEncoder(w).Encode(map[string]string{"token": token, "listen_url": listenURL})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
