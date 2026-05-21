@@ -1532,7 +1532,8 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 
 	ffCtx, ffCancel := context.WithCancel(context.Background())
 	ffCmd := exec.CommandContext(ffCtx, "ffmpeg",
-		"-loglevel", "warning",
+		"-loglevel", "error",
+		"-f", "webm",   // tell FFmpeg the input format — skip probing, required for live pipe
 		"-i", "pipe:0", // read WebM from stdin
 		"-vn",          // audio only
 		"-c:a", "aac",
@@ -1542,7 +1543,7 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 		"-f", "hls",
 		"-hls_time", "2",
 		"-hls_list_size", "5",
-		"-hls_flags", "delete_segments+independent_segments+append_list",
+		"-hls_flags", "delete_segments+independent_segments",
 		"-hls_segment_type", "mpegts",
 		"-hls_segment_filename", segPattern,
 		playlist,
@@ -1561,6 +1562,11 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 		ffStdin = nil
 	} else {
 		log.Printf("[hub/%s] FFmpeg HLS transcoder started → %s", stationSlug, playlist)
+		go func() {
+			if werr := ffCmd.Wait(); werr != nil {
+				log.Printf("[hub/%s] FFmpeg exited unexpectedly: %v", stationSlug, werr)
+			}
+		}()
 	}
 
 	h := getOrCreateHub(stationSlug)
