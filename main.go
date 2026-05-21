@@ -431,8 +431,9 @@ const (
 
 // Claims holds the JWT payload.
 type Claims struct {
-	UserID string `json:"user_id"`
-	Email  string `json:"email"`
+	UserID      string `json:"user_id"`
+	Email       string `json:"email"`
+	StationName string `json:"station_name"`
 	jwt.RegisteredClaims
 }
 
@@ -673,10 +674,11 @@ func ensureStation(userID, email, stationName, logoURL string) (string, error) {
 }
 
 // jwtSign creates a signed JWT for the given user (30-day expiry).
-func jwtSign(userID, email string) (string, error) {
+func jwtSign(userID, email, stationName string) (string, error) {
 	claims := Claims{
-		UserID: userID,
-		Email:  email,
+		UserID:      userID,
+		Email:       email,
+		StationName: stationName,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(30 * 24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -797,7 +799,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	token, err := jwtSign(userID, body.Email)
+	token, err := jwtSign(userID, body.Email, body.StationName)
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
@@ -855,7 +857,9 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
-	token, err := jwtSign(userID, body.Email)
+	var stationName string
+	_ = db.QueryRow(`SELECT station_name FROM stations WHERE user_id = $1`, userID).Scan(&stationName)
+	token, err := jwtSign(userID, body.Email, stationName)
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
@@ -872,6 +876,157 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(loginResp)
+}
+
+// handleUserProfile dispatches GET/PUT on /api/user/profile.
+func handleUserProfile(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(contextKeyUserID).(string)
+	email, _ := r.Context().Value(contextKeyEmail).(string)
+
+	switch r.Method {
+	case http.MethodGet:
+		var firstName, lastName string
+		_ = db.QueryRow(`SELECT first_name, last_name FROM users WHERE id = $1`, userID).Scan(&firstName, &lastName)
+		var stationName, genre, description, logoURL string
+		_ = db.QueryRow(`SELECT station_name, genre, description, logo_url FROM stations WHERE user_id = $1`, userID).
+			Scan(&stationName, &genre, &description, &logoURL)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"email":        email,
+			"first_name":   firstName,
+			"last_name":    lastName,
+			"station_name": stationName,
+			"genre":        genre,
+			"description":  description,
+			"logo_url":     logoURL,
+		})
+
+	case http.MethodPut:
+		var body struct {
+			Email       string `json:"email"`
+			FirstName   string `json:"first_name"`
+			LastName    string `json:"last_name"`
+			StationName string `json:"station_name"`
+			Genre       string `json:"genre"`
+			Description string `json:"description"`
+			LogoURL     string `json:"logo_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+
+		if body.Email != "" && body.Email != email {
+			_, err := db.Exec(`UPDATE users SET email = $1 WHERE id = $2`, body.Email, userID)
+			if err != nil {
+				if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+					http.Error(w, "email already in use", http.StatusConflict)
+					return
+				}
+				http.Error(w, "server error", http.StatusInternalServerError)
+				return
+			}
+			email = body.Email
+		}
+		if _, err := db.Exec(
+			`UPDATE users SET first_name = $1, last_name = $2 WHERE id = $3`,
+			strings.TrimSpace(body.FirstName), strings.TrimSpace(body.LastName), userID,
+		); err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		if _, err := db.Exec(
+			`UPDATE stations SET station_name = $1, genre = $2, description = $3, logo_url = $4 WHERE user_id = $5`,
+			strings.TrimSpace(body.StationName), body.Genre, strings.TrimSpace(body.Description), body.LogoURL, userID,
+		); err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		// Issue a fresh token so the frontend picks up any name/email change immediately
+		token, err := jwtSign(userID, email, strings.TrimSpace(body.StationName))
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"token": token})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleChangePassword changes the authenticated user's password.
+// PUT /api/user/password  {"current_password":"...","new_password":"..."}
+func handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID := r.Context().Value(contextKeyUserID).(string)
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if len(body.NewPassword) < 8 {
+		http.Error(w, "new password must be at least 8 characters", http.StatusBadRequest)
+		return
+	}
+	var hash string
+	if err := db.QueryRow(`SELECT password_hash FROM users WHERE id = $1`, userID).Scan(&hash); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.CurrentPassword)); err != nil {
+		http.Error(w, "current password is incorrect", http.StatusUnauthorized)
+		return
+	}
+	newHash, err := bcrypt.GenerateFromPassword([]byte(body.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if _, err := db.Exec(`UPDATE users SET password_hash = $1 WHERE id = $2`, string(newHash), userID); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDeleteAccount permanently deletes the authenticated user's account.
+// DELETE /api/user/account  {"password":"..."}
+func handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID := r.Context().Value(contextKeyUserID).(string)
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	var hash string
+	if err := db.QueryRow(`SELECT password_hash FROM users WHERE id = $1`, userID).Scan(&hash); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil {
+		http.Error(w, "incorrect password", http.StatusUnauthorized)
+		return
+	}
+	if _, err := db.Exec(`DELETE FROM users WHERE id = $1`, userID); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleStreamCredentials dispatches GET/PUT on /api/user/stream-credentials.
@@ -1044,8 +1199,9 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleConferenceToken issues a short-lived LiveKit JWT so the browser
-// can join an audio conference room. No authentication required —
-// possession of the room link is the access control.
+// can join an audio conference room. For authenticated users the display
+// name is always read from the stations table (authoritative). Guests
+// (no valid JWT) fall back to the ?username= query param.
 func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1055,12 +1211,12 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 	room := strings.TrimSpace(r.URL.Query().Get("room"))
 	username := strings.TrimSpace(r.URL.Query().Get("username"))
 
-	if room == "" || username == "" {
-		http.Error(w, "room and username are required", http.StatusBadRequest)
+	if room == "" {
+		http.Error(w, "room is required", http.StatusBadRequest)
 		return
 	}
-	if len(room) > 64 || len(username) > 64 {
-		http.Error(w, "room and username must be \u2264 64 characters", http.StatusBadRequest)
+	if len(room) > 64 {
+		http.Error(w, "room must be \u2264 64 characters", http.StatusBadRequest)
 		return
 	}
 	// Restrict room to safe characters (UUID-like: hex + hyphens)
@@ -1069,6 +1225,25 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid room id", http.StatusBadRequest)
 			return
 		}
+	}
+
+	// If the request carries a valid auth token, look up the station name
+	// from the DB so it is always current, regardless of JWT age.
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		if claims, err := jwtVerify(strings.TrimPrefix(authHeader, "Bearer ")); err == nil && claims.UserID != "" {
+			var stationName string
+			if dbErr := db.QueryRow(`SELECT station_name FROM stations WHERE user_id = $1`, claims.UserID).Scan(&stationName); dbErr == nil && strings.TrimSpace(stationName) != "" {
+				username = strings.TrimSpace(stationName)
+			}
+		}
+	}
+
+	if username == "" {
+		http.Error(w, "username is required", http.StatusBadRequest)
+		return
+	}
+	if len(username) > 64 {
+		username = username[:64]
 	}
 
 	apiKey := os.Getenv("LIVEKIT_API_KEY")
@@ -1092,6 +1267,7 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 	}
 	at.AddGrant(grant).
 		SetIdentity(username).
+		SetName(username).
 		SetValidFor(2 * time.Hour)
 
 	token, err := at.ToJWT()
@@ -1752,6 +1928,9 @@ func main() {
 	mux.HandleFunc("/api/auth/register", handleRegister)
 	mux.HandleFunc("/api/auth/login", handleLogin)
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
+	mux.HandleFunc("/api/user/profile", requireAuth(handleUserProfile))
+	mux.HandleFunc("/api/user/password", requireAuth(handleChangePassword))
+	mux.HandleFunc("/api/user/account", requireAuth(handleDeleteAccount))
 	mux.HandleFunc("/api/stations/", handleGetStation)
 	mux.HandleFunc("/api/stations", handleGetStations)
 	mux.HandleFunc("/ws/encode", handleEncoderWS)
