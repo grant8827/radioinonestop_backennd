@@ -539,7 +539,7 @@ func generateKey() (string, error) {
 type stationHub struct {
 	mu     sync.Mutex
 	subs   map[chan []byte]struct{}
-	header []byte      // first chunk (WebM EBML + segment header)
+	header []byte        // first chunk (WebM EBML + segment header)
 	done   chan struct{} // closed when broadcaster disconnects
 }
 
@@ -1511,6 +1511,46 @@ type encoderStatus struct {
 	Msg    string `json:"msg,omitempty"`
 }
 
+type tailBuffer struct {
+	mu   sync.Mutex
+	data []byte
+	max  int
+}
+
+func newTailBuffer(max int) *tailBuffer {
+	return &tailBuffer{max: max}
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.data = append(b.data, p...)
+	if b.max > 0 && len(b.data) > b.max {
+		b.data = append([]byte(nil), b.data[len(b.data)-b.max:]...)
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.TrimSpace(string(b.data))
+}
+
+func ffmpegStatusMessage(prefix string, err error, stderr *tailBuffer) string {
+	msg := prefix
+	if err != nil {
+		msg += ": " + err.Error()
+	}
+	if stderr != nil {
+		if detail := stderr.String(); detail != "" {
+			msg += ": " + detail
+		}
+	}
+	return msg
+}
+
 // handleBroadcast is the hub-mode branch of the encoder WebSocket.
 // The browser sends raw WebM/Opus audio chunks which are:
 //  1. Fanned out via the stationHub to /listen/{slug} HTTP clients (WebM, desktop-only)
@@ -1538,9 +1578,9 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 	ffCtx, ffCancel := context.WithCancel(context.Background())
 	ffCmd := exec.CommandContext(ffCtx, "ffmpeg",
 		"-loglevel", "error",
-		"-f", "webm",   // tell FFmpeg the input format — skip probing, required for live pipe
+		"-f", "webm", // tell FFmpeg the input format — skip probing, required for live pipe
 		"-i", "pipe:0", // read WebM from stdin
-		"-vn",          // audio only
+		"-vn", // audio only
 		"-c:a", "aac",
 		"-b:a", "128k",
 		"-ar", "44100",
@@ -1745,7 +1785,6 @@ func handleGetStation(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s)
 }
 
-
 func handleListen(w http.ResponseWriter, r *http.Request) {
 	slug := strings.TrimPrefix(r.URL.Path, "/listen/")
 	slug = strings.Trim(slug, "/")
@@ -1791,7 +1830,7 @@ func handleListen(w http.ResponseWriter, r *http.Request) {
 	ch := h.subscribe()
 	defer h.unsubscribe(ch)
 
-	db.Exec(`UPDATE stations SET current_listeners_count = current_listeners_count + 1 WHERE station_slug = $1`, slug) //nolint:errcheck
+	db.Exec(`UPDATE stations SET current_listeners_count = current_listeners_count + 1 WHERE station_slug = $1`, slug)                    //nolint:errcheck
 	defer db.Exec(`UPDATE stations SET current_listeners_count = GREATEST(0, current_listeners_count - 1) WHERE station_slug = $1`, slug) //nolint:errcheck
 
 	ctx := r.Context()
@@ -1936,11 +1975,11 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		Path:   cfg.Mount,
 	}
 
-	var audioCodec, outFmt string
+	var audioCodec, outFmt, contentType string
 	if codec == "aac" {
-		audioCodec, outFmt = "aac", "adts"
+		audioCodec, outFmt, contentType = "aac", "adts", "audio/aac"
 	} else {
-		audioCodec, outFmt = "libmp3lame", "mp3"
+		audioCodec, outFmt, contentType = "libmp3lame", "mp3", "audio/mpeg"
 	}
 
 	// FFmpeg args — exec.Command never passes these through a shell
@@ -1953,6 +1992,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		"-b:a", cfg.Bitrate,
 		"-ar", "44100",
 		"-ac", "2",
+		"-content_type", contentType,
 		"-f", outFmt,
 		icecastURL.String(),
 	}
@@ -1967,7 +2007,8 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	ffmpegStderr := newTailBuffer(16 * 1024)
+	cmd.Stderr = io.MultiWriter(os.Stderr, ffmpegStderr)
 
 	if err := cmd.Start(); err != nil {
 		sendStatus("error", "ffmpeg start: "+err.Error())
@@ -1984,8 +2025,12 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	// ── Pump WebSocket binary frames → FFmpeg stdin ────────────────────────
 	for {
 		select {
-		case <-ffmpegDone:
-			sendStatus("stopped", "FFmpeg process exited")
+		case err := <-ffmpegDone:
+			if err != nil {
+				sendStatus("error", ffmpegStatusMessage("FFmpeg exited", err, ffmpegStderr))
+			} else {
+				sendStatus("stopped", "FFmpeg process exited")
+			}
 			return
 		default:
 		}
@@ -2015,8 +2060,13 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		// Binary audio chunk
 		if _, err := stdin.Write(data); err != nil {
 			cancel()
-			sendStatus("error", "write to ffmpeg: "+err.Error())
-			<-ffmpegDone
+			stdin.Close() //nolint:errcheck
+			ffErr := <-ffmpegDone
+			if ffErr != nil || ffmpegStderr.String() != "" {
+				sendStatus("error", ffmpegStatusMessage("FFmpeg stopped before accepting audio", ffErr, ffmpegStderr))
+			} else {
+				sendStatus("error", "write to ffmpeg: "+err.Error())
+			}
 			return
 		}
 	}
