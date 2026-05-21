@@ -1106,6 +1106,11 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 			_, _ = db.Exec(`UPDATE stations SET source_password = $1 WHERE user_id = $2`, sourcePassword, userID)
 		}
 	}
+	// If a server-side global Icecast password is configured, expose that instead.
+	// External clients (BUTT, Mixxx) should use this password with any mount.
+	if envPass := os.Getenv("ICECAST_SOURCE_PASSWORD"); envPass != "" {
+		sourcePassword = envPass
+	}
 
 	rows, err := db.Query(
 		`SELECT platform, rtmp_url, stream_key, enabled FROM destinations WHERE user_id = $1 ORDER BY platform`,
@@ -1913,10 +1918,20 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		cfg.Port = p
 	}
 
+	// ── Resolve Icecast source password ───────────────────────────────────
+	// The server-side env var takes precedence over the client-supplied password.
+	// This lets us use a shared secret (set identically on the backend and Icecast
+	// services) without the browser needing to know it, and without requiring
+	// Icecast to make HTTP callbacks to the backend for URL auth.
+	icecastPass := cfg.Password
+	if envPass := os.Getenv("ICECAST_SOURCE_PASSWORD"); envPass != "" {
+		icecastPass = envPass
+	}
+
 	// ── Build icecast:// URL using net/url (safe, no shell injection) ──────
 	icecastURL := &url.URL{
 		Scheme: "icecast",
-		User:   url.UserPassword(cfg.Username, cfg.Password),
+		User:   url.UserPassword(cfg.Username, icecastPass),
 		Host:   cfg.Host + ":" + cfg.Port,
 		Path:   cfg.Mount,
 	}
