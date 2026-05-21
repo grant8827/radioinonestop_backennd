@@ -1638,6 +1638,10 @@ func handleIcecastAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Log every incoming auth request so we can confirm Icecast is reaching us.
+	log.Printf("[icecast-auth] request from=%s action=%q mount=%q user=%q",
+		r.RemoteAddr, r.FormValue("action"), r.FormValue("mount"), r.FormValue("user"))
+
 	// Non-source actions (e.g. listener auth) — allow by default.
 	action := r.FormValue("action")
 	if action != "source_auth" {
