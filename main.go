@@ -1507,8 +1507,10 @@ type encoderStatus struct {
 }
 
 // handleBroadcast is the hub-mode branch of the encoder WebSocket.
-// The browser sends raw WebM audio chunks; the server fans them out to
-// all active /listen/{slug} HTTP clients for this station.
+// The browser sends raw WebM/Opus audio chunks which are:
+//  1. Fanned out via the stationHub to /listen/{slug} HTTP clients (WebM, desktop-only)
+//  2. Also piped into an FFmpeg process that transcodes to HLS (AAC/MPEG-TS)
+//     served at /hls/{slug}/index.m3u8 — works on iOS, Android, and all browsers.
 func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), userID string) {
 	var stationSlug string
 	err := db.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&stationSlug)
@@ -1520,11 +1522,61 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 	db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1 WHERE user_id = $2`, //nolint:errcheck
 		time.Now().UTC().Format(time.RFC3339), userID)
 
+	// ── Start FFmpeg: WebM/Opus → HLS (AAC + MPEG-TS segments) ─────────────
+	hlsDir := filepath.Join(HLSDir, stationSlug)
+	if mkErr := os.MkdirAll(hlsDir, 0755); mkErr != nil {
+		log.Printf("[hub/%s] mkdir error: %v", stationSlug, mkErr)
+	}
+	playlist := filepath.Join(hlsDir, "index.m3u8")
+	segPattern := filepath.Join(hlsDir, "seg%05d.ts")
+
+	ffCtx, ffCancel := context.WithCancel(context.Background())
+	ffCmd := exec.CommandContext(ffCtx, "ffmpeg",
+		"-loglevel", "warning",
+		"-i", "pipe:0", // read WebM from stdin
+		"-vn",          // audio only
+		"-c:a", "aac",
+		"-b:a", "128k",
+		"-ar", "44100",
+		"-ac", "2",
+		"-f", "hls",
+		"-hls_time", "2",
+		"-hls_list_size", "5",
+		"-hls_flags", "delete_segments+independent_segments+append_list",
+		"-hls_segment_type", "mpegts",
+		"-hls_segment_filename", segPattern,
+		playlist,
+	)
+	ffCmd.Stdout = os.Stdout
+	ffCmd.Stderr = os.Stderr
+
+	var ffStdin io.WriteCloser
+	if ffStdin, err = ffCmd.StdinPipe(); err != nil {
+		log.Printf("[hub/%s] FFmpeg stdin pipe error: %v", stationSlug, err)
+		ffCancel()
+		ffStdin = nil
+	} else if err = ffCmd.Start(); err != nil {
+		log.Printf("[hub/%s] FFmpeg start error (HLS disabled): %v", stationSlug, err)
+		ffStdin.Close()
+		ffStdin = nil
+	} else {
+		log.Printf("[hub/%s] FFmpeg HLS transcoder started → %s", stationSlug, playlist)
+	}
+
 	h := getOrCreateHub(stationSlug)
 	sendStatus("live", "Broadcasting — listeners at /listen/"+stationSlug)
 	log.Printf("[hub/%s] broadcaster connected (user=%s)", stationSlug, userID)
 
 	defer func() {
+		// Stop FFmpeg and clean up HLS segments.
+		ffCancel()
+		if ffStdin != nil {
+			ffStdin.Close()
+		}
+		ffCmd.Wait() //nolint:errcheck
+		os.RemoveAll(hlsDir)
+		log.Printf("[hub/%s] HLS segments cleaned up", stationSlug)
+
 		closeHub(stationSlug, h)
 		db.Exec(`UPDATE stations SET is_live = false WHERE user_id = $1`, userID) //nolint:errcheck
 		log.Printf("[hub/%s] broadcaster disconnected", stationSlug)
@@ -1545,7 +1597,15 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 			}
 			continue
 		}
+		// Fan out raw WebM to /listen/ clients.
 		h.broadcast(data)
+		// Also feed FFmpeg for HLS transcoding.
+		if ffStdin != nil {
+			if _, werr := ffStdin.Write(data); werr != nil {
+				log.Printf("[hub/%s] FFmpeg write error: %v", stationSlug, werr)
+				ffStdin = nil
+			}
+		}
 	}
 }
 
