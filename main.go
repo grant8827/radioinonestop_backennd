@@ -1618,6 +1618,59 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 // handleListen streams live WebM audio from the station hub to an HTTP client.
 // GET /listen/{station_slug}
 
+// handleIcecastAuth is called by Icecast's URL authentication module.
+// Icecast POSTs form data: action, mount, user, pass, ip, agent.
+// We check whether the provided password matches the station's source_password
+// for the stream_key embedded in the mount path, then respond:
+//
+//	"awk=allow\r\n" → Icecast lets the source connect
+//	"awk=deny\r\n"  → Icecast rejects the source
+//
+// POST /api/icecast/auth
+func handleIcecastAuth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+
+	allow := func() { w.Write([]byte("awk=allow\r\n")) } //nolint:errcheck
+	deny := func() { w.Write([]byte("awk=deny\r\n")) }   //nolint:errcheck
+
+	if err := r.ParseForm(); err != nil {
+		deny()
+		return
+	}
+
+	// Non-source actions (e.g. listener auth) — allow by default.
+	action := r.FormValue("action")
+	if action != "source_auth" {
+		allow()
+		return
+	}
+
+	mount := strings.TrimPrefix(r.FormValue("mount"), "/")
+	pass := r.FormValue("pass")
+	if mount == "" || pass == "" {
+		deny()
+		return
+	}
+
+	// The mount path is the user's stream_key (e.g. /081924935dc8175a4b7d464b72fe652d).
+	// Look up the station whose user has this stream_key and verify source_password.
+	var storedPassword string
+	err := db.QueryRow(`
+		SELECT st.source_password
+		FROM stations st
+		JOIN users u ON u.id = st.user_id
+		WHERE u.stream_key = $1
+	`, mount).Scan(&storedPassword)
+	if err != nil || storedPassword == "" || storedPassword != pass {
+		log.Printf("[icecast-auth] denied mount=/%s", mount)
+		deny()
+		return
+	}
+
+	log.Printf("[icecast-auth] allowed mount=/%s", mount)
+	allow()
+}
+
 // handleGetStations returns all registered stations (public).
 // GET /api/stations
 func handleGetStations(w http.ResponseWriter, r *http.Request) {
@@ -2052,6 +2105,7 @@ func main() {
 	mux.HandleFunc("/api/user/password", requireAuth(handleChangePassword))
 	mux.HandleFunc("/api/user/account", requireAuth(handleDeleteAccount))
 	mux.HandleFunc("/api/stations/", handleGetStation)
+	mux.HandleFunc("/api/icecast/auth", handleIcecastAuth)
 	mux.HandleFunc("/api/stations", handleGetStations)
 	mux.HandleFunc("/ws/encode", handleEncoderWS)
 	mux.HandleFunc("/listen/", handleListen)
