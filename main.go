@@ -1950,10 +1950,10 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	// ICECAST_HOST / ICECAST_PORT env vars let the server admin pin the
 	// Icecast endpoint (e.g. Railway private networking) regardless of what
 	// the browser sends.  When unset the client-supplied values are used.
-	if h := os.Getenv("ICECAST_HOST"); h != "" {
+	if h := strings.TrimSpace(os.Getenv("ICECAST_HOST")); h != "" {
 		cfg.Host = h
 	}
-	if p := os.Getenv("ICECAST_PORT"); p != "" {
+	if p := strings.TrimSpace(os.Getenv("ICECAST_PORT")); p != "" {
 		cfg.Port = p
 	}
 
