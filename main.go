@@ -513,6 +513,7 @@ func initDB(dsn string) error {
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS source_password TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err = db.Exec(migration); err != nil {
 			return err
@@ -668,11 +669,15 @@ func ensureStation(userID, email, stationName, logoURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	sourcePassword, err := generateKey()
+	if err != nil {
+		return "", err
+	}
 	_, err = db.Exec(
-		`INSERT INTO stations (id, user_id, station_slug, station_name, logo_url, is_live, current_listeners_count)
-		 VALUES ($1, $2, $3, $4, $5, false, 0)
+		`INSERT INTO stations (id, user_id, station_slug, station_name, logo_url, is_live, current_listeners_count, source_password)
+		 VALUES ($1, $2, $3, $4, $5, false, 0, $6)
 		 ON CONFLICT DO NOTHING`,
-		stationID, userID, slug, stationName, logoURL,
+		stationID, userID, slug, stationName, logoURL, sourcePassword,
 	)
 	if err != nil {
 		return "", err
@@ -1091,6 +1096,16 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 	// Ensure a station row exists (idempotent — safe for existing users)
 	stationSlug, _ := ensureStation(userID, email, "", "")
 
+	// Fetch source_password; generate one if this is a pre-migration station row
+	var sourcePassword string
+	_ = db.QueryRow(`SELECT source_password FROM stations WHERE user_id = $1`, userID).Scan(&sourcePassword)
+	if sourcePassword == "" {
+		if p, err := generateKey(); err == nil {
+			sourcePassword = p
+			_, _ = db.Exec(`UPDATE stations SET source_password = $1 WHERE user_id = $2`, sourcePassword, userID)
+		}
+	}
+
 	rows, err := db.Query(
 		`SELECT platform, rtmp_url, stream_key, enabled FROM destinations WHERE user_id = $1 ORDER BY platform`,
 		userID,
@@ -1124,6 +1139,7 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 		"rtmp_url":         rtmpIngestBase + "/" + streamKey,
 		"rtmp_ingest_base": rtmpIngestBase,
 		"destinations":     dests,
+		"source_password":  sourcePassword,
 	}
 	if stationSlug != "" {
 		resp["station_slug"] = stationSlug
