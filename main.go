@@ -899,9 +899,9 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		var firstName, lastName string
 		_ = db.QueryRow(`SELECT first_name, last_name FROM users WHERE id = $1`, userID).Scan(&firstName, &lastName)
-		var stationName, genre, description, logoURL string
-		_ = db.QueryRow(`SELECT station_name, genre, description, logo_url FROM stations WHERE user_id = $1`, userID).
-			Scan(&stationName, &genre, &description, &logoURL)
+		var stationName, genre, description, logoURL, stationSlug string
+		_ = db.QueryRow(`SELECT station_name, genre, description, logo_url, station_slug FROM stations WHERE user_id = $1`, userID).
+			Scan(&stationName, &genre, &description, &logoURL, &stationSlug)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
 			"email":        email,
@@ -911,6 +911,7 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 			"genre":        genre,
 			"description":  description,
 			"logo_url":     logoURL,
+			"listen_url":   "/listen/" + stationSlug,
 		})
 
 	case http.MethodPut:
