@@ -514,6 +514,7 @@ func initDB(dsn string) error {
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS source_password TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS icecast_listen_url TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err = db.Exec(migration); err != nil {
 			return err
@@ -1724,7 +1725,7 @@ func handleIcecastAuth(w http.ResponseWriter, r *http.Request) {
 // GET /api/stations
 func handleGetStations(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description
+		SELECT station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
 		FROM stations
 		ORDER BY is_live DESC, station_name ASC
 	`)
@@ -1734,18 +1735,19 @@ func handleGetStations(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	type Station struct {
-		Slug      string `json:"slug"`
-		Name      string `json:"name"`
-		LogoURL   string `json:"logo_url"`
-		IsLive    bool   `json:"is_live"`
-		Listeners int    `json:"listeners"`
-		Genre     string `json:"genre"`
-		Desc      string `json:"description"`
+		Slug             string `json:"slug"`
+		Name             string `json:"name"`
+		LogoURL          string `json:"logo_url"`
+		IsLive           bool   `json:"is_live"`
+		Listeners        int    `json:"listeners"`
+		Genre            string `json:"genre"`
+		Desc             string `json:"description"`
+		IcecastListenURL string `json:"icecast_listen_url"`
 	}
 	stations := []Station{}
 	for rows.Next() {
 		var s Station
-		if err := rows.Scan(&s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc); err != nil {
+		if err := rows.Scan(&s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc, &s.IcecastListenURL); err != nil {
 			continue
 		}
 		stations = append(stations, s)
@@ -1764,19 +1766,20 @@ func handleGetStation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type Station struct {
-		Slug      string `json:"slug"`
-		Name      string `json:"name"`
-		LogoURL   string `json:"logo_url"`
-		IsLive    bool   `json:"is_live"`
-		Listeners int    `json:"listeners"`
-		Genre     string `json:"genre"`
-		Desc      string `json:"description"`
+		Slug             string `json:"slug"`
+		Name             string `json:"name"`
+		LogoURL          string `json:"logo_url"`
+		IsLive           bool   `json:"is_live"`
+		Listeners        int    `json:"listeners"`
+		Genre            string `json:"genre"`
+		Desc             string `json:"description"`
+		IcecastListenURL string `json:"icecast_listen_url"`
 	}
 	var s Station
 	err := db.QueryRow(`
-		SELECT station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description
+		SELECT station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
 		FROM stations WHERE station_slug = $1
-	`, slug).Scan(&s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc)
+	`, slug).Scan(&s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc, &s.IcecastListenURL)
 	if err != nil {
 		http.Error(w, `{"error":"station not found"}`, http.StatusNotFound)
 		return
@@ -2036,6 +2039,12 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	case <-startupTimer.C:
 		// still running — Icecast accepted the connection
 	}
+
+	// Mark station live in DB so the home page card updates.
+	icecastListenURL := "/icecast" + cfg.Mount
+	db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1, icecast_listen_url = $2 WHERE user_id = $3`, //nolint:errcheck
+		time.Now().UTC().Format(time.RFC3339), icecastListenURL, claims.UserID)
+	defer db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, claims.UserID) //nolint:errcheck
 
 	sendStatus("live", fmt.Sprintf("Streaming → %s:%s%s", cfg.Host, cfg.Port, cfg.Mount))
 
