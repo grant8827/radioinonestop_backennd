@@ -1956,6 +1956,10 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	if p := strings.TrimSpace(os.Getenv("ICECAST_PORT")); p != "" {
 		cfg.Port = p
 	}
+	if _, err := net.LookupHost(cfg.Host); err != nil {
+		sendStatus("error", fmt.Sprintf("cannot resolve Icecast host %q: %v", cfg.Host, err))
+		return
+	}
 
 	// ── Resolve Icecast source password ───────────────────────────────────
 	// The server-side env var takes precedence over the client-supplied password.
@@ -1984,7 +1988,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 
 	// FFmpeg args — exec.Command never passes these through a shell
 	args := []string{
-		"-loglevel", "warning",
+		"-loglevel", "error",
 		"-f", "webm",
 		"-i", "pipe:0",
 		"-vn",
@@ -2017,10 +2021,23 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[encoder/%s] started → %s:%s%s (codec=%s bitrate=%s)",
 		claims.UserID, cfg.Host, cfg.Port, cfg.Mount, codec, cfg.Bitrate)
 
-	sendStatus("live", fmt.Sprintf("Streaming → %s:%s%s", cfg.Host, cfg.Port, cfg.Mount))
-
 	ffmpegDone := make(chan error, 1)
 	go func() { ffmpegDone <- cmd.Wait() }()
+
+	// ── Wait up to 3 s for early FFmpeg failure before declaring live ─────
+	// FFmpeg exits almost instantly on bad hostname/password; only after
+	// surviving this window do we tell the client the stream is live.
+	startupTimer := time.NewTimer(3 * time.Second)
+	select {
+	case err := <-ffmpegDone:
+		startupTimer.Stop()
+		sendStatus("error", ffmpegStatusMessage("FFmpeg failed to connect to Icecast", err, ffmpegStderr))
+		return
+	case <-startupTimer.C:
+		// still running — Icecast accepted the connection
+	}
+
+	sendStatus("live", fmt.Sprintf("Streaming → %s:%s%s", cfg.Host, cfg.Port, cfg.Mount))
 
 	// ── Pump WebSocket binary frames → FFmpeg stdin ────────────────────────
 	for {
