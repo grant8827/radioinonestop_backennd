@@ -2048,6 +2048,26 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 
 	sendStatus("live", fmt.Sprintf("Streaming → %s:%s%s", cfg.Host, cfg.Port, cfg.Mount))
 
+	// ── Keepalive pings ────────────────────────────────────────────────────
+	// Railway (and most reverse proxies) will drop WebSocket connections that
+	// show no *control* frames for ~5 minutes, even if binary audio data is
+	// flowing.  Send a WS Ping every 30 s so the proxy resets its idle timer.
+	pingTicker := time.NewTicker(30 * time.Second)
+	defer pingTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	conn.SetPongHandler(func(string) error { return nil })
+
 	// ── Pump WebSocket binary frames → FFmpeg stdin ────────────────────────
 	for {
 		select {
@@ -2061,7 +2081,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		mt, data, err := conn.ReadMessage()
 		conn.SetReadDeadline(time.Time{})
 		if err != nil {
