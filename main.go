@@ -613,6 +613,103 @@ func hashIP(ip string) string {
 	return hex.EncodeToString(h[:])
 }
 
+func icecastListenerCountForUser(userID string) int {
+	activeSessionsMu.Lock()
+	defer activeSessionsMu.Unlock()
+	return len(activeSessions[userID])
+}
+
+func webListenerCountForUser(userID string) int {
+	webListenerSessionsMu.Lock()
+	defer webListenerSessionsMu.Unlock()
+	n := 0
+	for _, sess := range webListenerSessions {
+		if sess.userID == userID {
+			n++
+		}
+	}
+	return n
+}
+
+func totalLiveListenerCount(userID string) int {
+	return icecastListenerCountForUser(userID) + webListenerCountForUser(userID)
+}
+
+func syncLiveListenerCount(userID string) {
+	if userID == "" {
+		return
+	}
+	count := totalLiveListenerCount(userID)
+	_, _ = db.Exec(`UPDATE stations SET current_listeners_count = $1 WHERE user_id = $2`, count, userID)
+}
+
+func registerWebListener(userID, slug string, ttl time.Duration) (string, error) {
+	sessionID, err := generateKey()
+	if err != nil {
+		return "", err
+	}
+	sess := &webListenerSession{userID: userID, slug: slug}
+	if ttl > 0 {
+		sess.expiresAt = time.Now().Add(ttl)
+	}
+	webListenerSessionsMu.Lock()
+	webListenerSessions[sessionID] = sess
+	webListenerSessionsMu.Unlock()
+	syncLiveListenerCount(userID)
+	return sessionID, nil
+}
+
+func touchWebListener(sessionID string, ttl time.Duration) bool {
+	webListenerSessionsMu.Lock()
+	sess, ok := webListenerSessions[sessionID]
+	if ok && ttl > 0 {
+		sess.expiresAt = time.Now().Add(ttl)
+	}
+	webListenerSessionsMu.Unlock()
+	return ok
+}
+
+func webListenerMatches(sessionID, slug string) bool {
+	webListenerSessionsMu.Lock()
+	defer webListenerSessionsMu.Unlock()
+	sess, ok := webListenerSessions[sessionID]
+	return ok && sess.slug == slug
+}
+
+func unregisterWebListener(sessionID string) {
+	webListenerSessionsMu.Lock()
+	sess, ok := webListenerSessions[sessionID]
+	if ok {
+		delete(webListenerSessions, sessionID)
+	}
+	webListenerSessionsMu.Unlock()
+	if ok {
+		syncLiveListenerCount(sess.userID)
+	}
+}
+
+func startWebListenerCleanup() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			affected := map[string]bool{}
+			webListenerSessionsMu.Lock()
+			for id, sess := range webListenerSessions {
+				if !sess.expiresAt.IsZero() && now.After(sess.expiresAt) {
+					affected[sess.userID] = true
+					delete(webListenerSessions, id)
+				}
+			}
+			webListenerSessionsMu.Unlock()
+			for userID := range affected {
+				syncLiveListenerCount(userID)
+			}
+		}
+	}()
+}
+
 // icecastXML models the /admin/listclients XML response.
 type icecastXML struct {
 	Sources []icecastSource `xml:"source"`
@@ -635,10 +732,20 @@ type activeSession struct {
 	startedAt   time.Time
 }
 
+// webListenerSession tracks listeners served through the app player/HLS paths.
+type webListenerSession struct {
+	userID    string
+	slug      string
+	expiresAt time.Time // zero means tied to an open HTTP stream
+}
+
 var (
 	// activeSessions: userID → ipHash → session
 	activeSessions   = map[string]map[string]*activeSession{}
 	activeSessionsMu sync.Mutex
+
+	webListenerSessions   = map[string]*webListenerSession{}
+	webListenerSessionsMu sync.Mutex
 )
 
 func startAnalyticsWorker() {
@@ -734,6 +841,10 @@ func pollMount(client *http.Client, base, user, pass, userID, streamKey string) 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[analytics] pollMount GET %s status %d", reqURL, resp.StatusCode)
+		activeSessionsMu.Lock()
+		closeAllSessions(userID)
+		activeSessionsMu.Unlock()
+		syncLiveListenerCount(userID)
 		return
 	}
 
@@ -776,8 +887,9 @@ func pollMount(client *http.Client, base, user, pass, userID, streamKey string) 
 
 	// Update hourly stats + sync live count to stations table.
 	concurrent := len(currentIPs)
-	// Always sync so the count drops to 0 when all listeners disconnect.
-	go db.Exec(`UPDATE stations SET current_listeners_count = $1 WHERE user_id = $2`, concurrent, userID) //nolint:errcheck
+	// Always sync so the count drops to 0 when all listeners disconnect,
+	// while preserving web/HLS listeners counted outside Icecast.
+	go syncLiveListenerCount(userID)
 	if concurrent > 0 {
 		hourBucket := time.Now().UTC().Truncate(time.Hour)
 		db.Exec(` //nolint:errcheck
@@ -861,7 +973,6 @@ func handleAnalytics(w http.ResponseWriter, r *http.Request) {
 
 	// ── Live count from in-memory sessions ──────────────────────────────────
 	activeSessionsMu.Lock()
-	liveCount := len(activeSessions[userID])
 	// Snapshot country counts from active sessions.
 	countryCounts := map[string]struct {
 		code, name string
@@ -875,6 +986,7 @@ func handleAnalytics(w http.ResponseWriter, r *http.Request) {
 		countryCounts[sess.countryCode] = e
 	}
 	activeSessionsMu.Unlock()
+	liveCount := totalLiveListenerCount(userID)
 
 	now := time.Now().UTC()
 	dayStart := now.Truncate(24 * time.Hour)
@@ -2186,6 +2298,85 @@ func handleIcecastAuth(w http.ResponseWriter, r *http.Request) {
 	allow()
 }
 
+// handleListenerSession starts, refreshes, or stops a web/HLS listener session.
+// POST /api/listeners/start     {"slug":"station-slug"}
+// POST /api/listeners/heartbeat {"session_id":"..."}
+// POST /api/listeners/stop      {"session_id":"..."}
+func handleListenerSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.URL.Path {
+	case "/api/listeners/start":
+		var body struct {
+			Slug string `json:"slug"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		slug := strings.TrimSpace(body.Slug)
+		if slug == "" || strings.ContainsAny(slug, " \t\n\r/") {
+			http.Error(w, `{"error":"invalid station id"}`, http.StatusBadRequest)
+			return
+		}
+
+		var userID string
+		var isLive bool
+		err := db.QueryRow(`SELECT user_id, is_live FROM stations WHERE station_slug = $1`, slug).Scan(&userID, &isLive)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, `{"error":"station not found"}`, http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+			return
+		}
+		if !isLive {
+			http.Error(w, `{"error":"station is offline"}`, http.StatusConflict)
+			return
+		}
+
+		sessionID, err := registerWebListener(userID, slug, 30*time.Second)
+		if err != nil {
+			http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"session_id": sessionID})
+
+	case "/api/listeners/heartbeat":
+		var body struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.SessionID == "" {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		if !touchWebListener(body.SessionID, 30*time.Second) {
+			http.Error(w, `{"error":"listener session not found"}`, http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	case "/api/listeners/stop":
+		var body struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.SessionID == "" {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		unregisterWebListener(body.SessionID)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 // handleGetStations returns all registered stations (public).
 // GET /api/stations
 func handleGetStations(w http.ResponseWriter, r *http.Request) {
@@ -2262,8 +2453,9 @@ func handleListen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify station exists in DB
+	var userID string
 	var isLive bool
-	err := db.QueryRow(`SELECT is_live FROM stations WHERE station_slug = $1`, slug).Scan(&isLive)
+	err := db.QueryRow(`SELECT user_id, is_live FROM stations WHERE station_slug = $1`, slug).Scan(&userID, &isLive)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "station not found", http.StatusNotFound)
 		return
@@ -2298,8 +2490,15 @@ func handleListen(w http.ResponseWriter, r *http.Request) {
 	ch := h.subscribe()
 	defer h.unsubscribe(ch)
 
-	db.Exec(`UPDATE stations SET current_listeners_count = current_listeners_count + 1 WHERE station_slug = $1`, slug)                    //nolint:errcheck
-	defer db.Exec(`UPDATE stations SET current_listeners_count = GREATEST(0, current_listeners_count - 1) WHERE station_slug = $1`, slug) //nolint:errcheck
+	existingSessionID := r.URL.Query().Get("listener_session")
+	if existingSessionID != "" && webListenerMatches(existingSessionID, slug) {
+		touchWebListener(existingSessionID, 30*time.Second)
+	} else {
+		sessionID, err := registerWebListener(userID, slug, 0)
+		if err == nil {
+			defer unregisterWebListener(sessionID)
+		}
+	}
 
 	ctx := r.Context()
 	for {
@@ -2661,6 +2860,7 @@ func main() {
 	// GeoIP + Icecast analytics worker.
 	initGeoIP()
 	startAnalyticsWorker()
+	startWebListenerCleanup()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -2691,6 +2891,9 @@ func main() {
 	mux.HandleFunc("/api/user/account", requireAuth(handleDeleteAccount))
 	mux.HandleFunc("/api/stations/", handleGetStation)
 	mux.HandleFunc("/api/icecast/auth", handleIcecastAuth)
+	mux.HandleFunc("/api/listeners/start", handleListenerSession)
+	mux.HandleFunc("/api/listeners/heartbeat", handleListenerSession)
+	mux.HandleFunc("/api/listeners/stop", handleListenerSession)
 	mux.HandleFunc("/api/stations", handleGetStations)
 	mux.HandleFunc("/ws/encode", handleEncoderWS)
 	mux.HandleFunc("/listen/", handleListen)
