@@ -755,8 +755,10 @@ func pollMount(client *http.Client, base, user, pass, userID, streamKey string) 
 	}
 	activeSessionsMu.Unlock()
 
-	// Update hourly stats.
+	// Update hourly stats + sync live count to stations table.
 	concurrent := len(currentIPs)
+	// Always sync so the count drops to 0 when all listeners disconnect.
+	go db.Exec(`UPDATE stations SET current_listeners_count = $1 WHERE user_id = $2`, concurrent, userID) //nolint:errcheck
 	if concurrent > 0 {
 		hourBucket := time.Now().UTC().Truncate(time.Hour)
 		db.Exec(` //nolint:errcheck
@@ -821,14 +823,14 @@ type analyticsCountry struct {
 }
 
 type analyticsResponse struct {
-	LiveCount      int                 `json:"live_count"`
-	DailySessions  int                 `json:"daily_sessions"`
+	LiveCount       int                `json:"live_count"`
+	DailySessions   int                `json:"daily_sessions"`
 	MonthlySessions int                `json:"monthly_sessions"`
 	AvgDurationSecs float64            `json:"avg_duration_secs"`
-	Countries      []analyticsCountry  `json:"countries"`
-	ChartLabels    []string            `json:"chart_labels"`
-	ChartData      []int               `json:"chart_data"`
-	RawSample      json.RawMessage     `json:"raw_sample"`
+	Countries       []analyticsCountry `json:"countries"`
+	ChartLabels     []string           `json:"chart_labels"`
+	ChartData       []int              `json:"chart_data"`
+	RawSample       json.RawMessage    `json:"raw_sample"`
 }
 
 func handleAnalytics(w http.ResponseWriter, r *http.Request) {
@@ -842,7 +844,10 @@ func handleAnalytics(w http.ResponseWriter, r *http.Request) {
 	activeSessionsMu.Lock()
 	liveCount := len(activeSessions[userID])
 	// Snapshot country counts from active sessions.
-	countryCounts := map[string]struct{ code, name string; n int }{}
+	countryCounts := map[string]struct {
+		code, name string
+		n          int
+	}{}
 	for _, sess := range activeSessions[userID] {
 		e := countryCounts[sess.countryCode]
 		e.code = sess.countryCode
@@ -884,7 +889,10 @@ func handleAnalytics(w http.ResponseWriter, r *http.Request) {
 				var code, name string
 				var n int
 				if rows.Scan(&code, &name, &n) == nil {
-					countryCounts[code] = struct{ code, name string; n int }{code, name, n}
+					countryCounts[code] = struct {
+						code, name string
+						n          int
+					}{code, name, n}
 				}
 			}
 		}
