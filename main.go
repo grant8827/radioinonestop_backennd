@@ -22,9 +22,11 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +48,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/lib/pq"
 	"github.com/livekit/protocol/auth"
+	"github.com/oschwald/geoip2-golang"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -505,6 +508,41 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
+	// Listener analytics tables.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS listener_sessions (
+			id               TEXT PRIMARY KEY,
+			user_id          TEXT NOT NULL,
+			mount            TEXT NOT NULL,
+			ip_hash          TEXT NOT NULL,
+			country_code     TEXT NOT NULL DEFAULT 'XX',
+			country_name     TEXT NOT NULL DEFAULT 'Unknown',
+			started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			ended_at         TIMESTAMPTZ,
+			connected_secs   INTEGER NOT NULL DEFAULT 0,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_ls_user_started ON listener_sessions(user_id, started_at)`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS listener_hourly (
+			user_id        TEXT NOT NULL,
+			hour_bucket    TIMESTAMPTZ NOT NULL,
+			max_concurrent INTEGER NOT NULL DEFAULT 0,
+			unique_ips     INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (user_id, hour_bucket)
+		)
+	`)
+	if err != nil {
+		return err
+	}
 	// Idempotent migrations for existing databases.
 	for _, migration := range []string{
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS station_name TEXT NOT NULL DEFAULT ''`,
@@ -521,6 +559,406 @@ func initDB(dsn string) error {
 		}
 	}
 	return nil
+}
+
+// ─── Analytics — GeoIP + Icecast Poller ──────────────────────────────────────
+
+var geoipDB *geoip2.Reader
+
+func initGeoIP() {
+	path := os.Getenv("GEOIP_DB_PATH")
+	if path == "" {
+		log.Printf("[geoip] GEOIP_DB_PATH not set — country resolution disabled")
+		log.Printf("[geoip] Download GeoLite2-Country.mmdb from https://dev.maxmind.com/geoip/geolite2-free-geolocation-data")
+		return
+	}
+	var err error
+	geoipDB, err = geoip2.Open(path)
+	if err != nil {
+		log.Printf("[geoip] Failed to open %s: %v — country resolution disabled", path, err)
+		return
+	}
+	log.Printf("[geoip] Loaded GeoIP database from %s", path)
+}
+
+func resolveCountry(ipStr string) (code, name string) {
+	code, name = "XX", "Unknown"
+	if geoipDB == nil {
+		return
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return
+	}
+	// Private / loopback addresses → mark as Local.
+	for _, cidr := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128", "fc00::/7"} {
+		_, block, _ := net.ParseCIDR(cidr)
+		if block != nil && block.Contains(ip) {
+			return "LC", "Local"
+		}
+	}
+	record, err := geoipDB.Country(ip)
+	if err != nil || record.Country.IsoCode == "" {
+		return
+	}
+	code = record.Country.IsoCode
+	if n, ok := record.Country.Names["en"]; ok {
+		name = n
+	}
+	return
+}
+
+func hashIP(ip string) string {
+	h := sha256.Sum256([]byte(ip))
+	return hex.EncodeToString(h[:])
+}
+
+// icecastXML models the /admin/listclients XML response.
+type icecastXML struct {
+	Sources []icecastSource `xml:"source"`
+}
+type icecastSource struct {
+	Mount     string            `xml:"mount,attr"`
+	Listeners []icecastListener `xml:"listener"`
+}
+type icecastListener struct {
+	IP        string `xml:"IP"`
+	Connected int    `xml:"Connected"` // seconds connected
+}
+
+// activeSession tracks an open listener session in memory.
+type activeSession struct {
+	sessionID   string
+	ipHash      string
+	countryCode string
+	countryName string
+	startedAt   time.Time
+}
+
+var (
+	// activeSessions: userID → ipHash → session
+	activeSessions   = map[string]map[string]*activeSession{}
+	activeSessionsMu sync.Mutex
+)
+
+func startAnalyticsWorker() {
+	icecastBase := os.Getenv("ICECAST_URL")
+	if icecastBase == "" {
+		icecastBase = "http://localhost:8000"
+	}
+	icecastUser := os.Getenv("ICECAST_ADMIN_USER")
+	if icecastUser == "" {
+		icecastUser = "admin"
+	}
+	icecastPass := os.Getenv("ICECAST_ADMIN_PASSWORD")
+	if icecastPass == "" {
+		icecastPass = "changeme123"
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			pollAllMounts(client, icecastBase, icecastUser, icecastPass)
+		}
+	}()
+	log.Printf("[analytics] Icecast poller started → %s", icecastBase)
+}
+
+// pollAllMounts fetches live mounts from the DB and polls each one.
+func pollAllMounts(client *http.Client, base, user, pass string) {
+	rows, err := db.Query(`SELECT u.id, u.stream_key FROM users u
+		JOIN stations s ON s.user_id = u.id WHERE s.is_live = true`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	type mountUser struct{ userID, streamKey string }
+	var live []mountUser
+	for rows.Next() {
+		var mu mountUser
+		if err := rows.Scan(&mu.userID, &mu.streamKey); err == nil {
+			live = append(live, mu)
+		}
+	}
+
+	// For users no longer live, close their open sessions.
+	activeSessionsMu.Lock()
+	liveSet := map[string]bool{}
+	for _, mu := range live {
+		liveSet[mu.userID] = true
+	}
+	for userID := range activeSessions {
+		if !liveSet[userID] {
+			closeAllSessions(userID)
+		}
+	}
+	activeSessionsMu.Unlock()
+
+	for _, mu := range live {
+		pollMount(client, base, user, pass, mu.userID, mu.streamKey)
+	}
+}
+
+func pollMount(client *http.Client, base, user, pass, userID, streamKey string) {
+	mount := "/" + streamKey
+	reqURL := base + "/admin/listclients?mount=" + url.QueryEscape(mount)
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	if err != nil {
+		return
+	}
+	req.SetBasicAuth(user, pass)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	var stats icecastXML
+	if err := xml.Unmarshal(body, &stats); err != nil {
+		return
+	}
+
+	// Collect current IPs from this poll.
+	currentIPs := map[string]int{} // ipHash → connected_secs
+	for _, src := range stats.Sources {
+		for _, l := range src.Listeners {
+			h := hashIP(l.IP)
+			currentIPs[h] = l.Connected
+			code, cname := resolveCountry(l.IP)
+			upsertSession(userID, mount, h, code, cname, l.Connected)
+		}
+	}
+
+	// Close sessions for IPs that vanished.
+	activeSessionsMu.Lock()
+	if sessions, ok := activeSessions[userID]; ok {
+		for ipHash := range sessions {
+			if _, still := currentIPs[ipHash]; !still {
+				sessionID := sessions[ipHash].sessionID
+				delete(sessions, ipHash)
+				go db.Exec(`UPDATE listener_sessions SET ended_at = NOW() WHERE id = $1`, sessionID) //nolint:errcheck
+			}
+		}
+	}
+	activeSessionsMu.Unlock()
+
+	// Update hourly stats.
+	concurrent := len(currentIPs)
+	if concurrent > 0 {
+		hourBucket := time.Now().UTC().Truncate(time.Hour)
+		db.Exec(` //nolint:errcheck
+			INSERT INTO listener_hourly (user_id, hour_bucket, max_concurrent, unique_ips)
+			VALUES ($1, $2, $3, $3)
+			ON CONFLICT (user_id, hour_bucket) DO UPDATE
+				SET max_concurrent = GREATEST(listener_hourly.max_concurrent, EXCLUDED.max_concurrent),
+				    unique_ips     = GREATEST(listener_hourly.unique_ips, EXCLUDED.unique_ips)
+		`, userID, hourBucket, concurrent)
+	}
+}
+
+func upsertSession(userID, mount, ipHash, countryCode, countryName string, connSecs int) {
+	activeSessionsMu.Lock()
+	defer activeSessionsMu.Unlock()
+
+	if activeSessions[userID] == nil {
+		activeSessions[userID] = map[string]*activeSession{}
+	}
+
+	if sess, exists := activeSessions[userID][ipHash]; exists {
+		// Update last_seen and connected_secs.
+		go db.Exec(` //nolint:errcheck
+			UPDATE listener_sessions SET last_seen_at = NOW(), connected_secs = $1 WHERE id = $2
+		`, connSecs, sess.sessionID)
+		return
+	}
+
+	// New session.
+	sessionID, _ := generateKey()
+	sess := &activeSession{
+		sessionID:   sessionID,
+		ipHash:      ipHash,
+		countryCode: countryCode,
+		countryName: countryName,
+		startedAt:   time.Now(),
+	}
+	activeSessions[userID][ipHash] = sess
+	go db.Exec(` //nolint:errcheck
+		INSERT INTO listener_sessions (id, user_id, mount, ip_hash, country_code, country_name, started_at, last_seen_at, connected_secs)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), $7)
+		ON CONFLICT (id) DO NOTHING
+	`, sessionID, userID, mount, ipHash, countryCode, countryName, 0)
+}
+
+func closeAllSessions(userID string) {
+	sessions := activeSessions[userID]
+	for _, sess := range sessions {
+		sid := sess.sessionID
+		go db.Exec(`UPDATE listener_sessions SET ended_at = NOW() WHERE id = $1`, sid) //nolint:errcheck
+	}
+	delete(activeSessions, userID)
+}
+
+// ─── Analytics REST endpoint ──────────────────────────────────────────────────
+
+type analyticsCountry struct {
+	Code  string  `json:"code"`
+	Name  string  `json:"name"`
+	Count int     `json:"count"`
+	Pct   float64 `json:"pct"`
+}
+
+type analyticsResponse struct {
+	LiveCount      int                 `json:"live_count"`
+	DailySessions  int                 `json:"daily_sessions"`
+	MonthlySessions int                `json:"monthly_sessions"`
+	AvgDurationSecs float64            `json:"avg_duration_secs"`
+	Countries      []analyticsCountry  `json:"countries"`
+	ChartLabels    []string            `json:"chart_labels"`
+	ChartData      []int               `json:"chart_data"`
+	RawSample      json.RawMessage     `json:"raw_sample"`
+}
+
+func handleAnalytics(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(contextKeyUserID).(string)
+	if !ok || userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// ── Live count from in-memory sessions ──────────────────────────────────
+	activeSessionsMu.Lock()
+	liveCount := len(activeSessions[userID])
+	// Snapshot country counts from active sessions.
+	countryCounts := map[string]struct{ code, name string; n int }{}
+	for _, sess := range activeSessions[userID] {
+		e := countryCounts[sess.countryCode]
+		e.code = sess.countryCode
+		e.name = sess.countryName
+		e.n++
+		countryCounts[sess.countryCode] = e
+	}
+	activeSessionsMu.Unlock()
+
+	now := time.Now().UTC()
+	dayStart := now.Truncate(24 * time.Hour)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	weeksAgo6 := now.AddDate(0, 0, -42)
+
+	// ── Daily sessions ──────────────────────────────────────────────────────
+	var dailySessions int
+	db.QueryRow(`SELECT COUNT(DISTINCT ip_hash) FROM listener_sessions
+		WHERE user_id = $1 AND started_at >= $2`, userID, dayStart).Scan(&dailySessions) //nolint:errcheck
+
+	// ── Monthly sessions ────────────────────────────────────────────────────
+	var monthlySessions int
+	db.QueryRow(`SELECT COUNT(DISTINCT ip_hash) FROM listener_sessions
+		WHERE user_id = $1 AND started_at >= $2`, userID, monthStart).Scan(&monthlySessions) //nolint:errcheck
+
+	// ── Avg duration (completed sessions only) ──────────────────────────────
+	var avgDuration float64
+	db.QueryRow(`SELECT COALESCE(AVG(connected_secs), 0) FROM listener_sessions
+		WHERE user_id = $1 AND ended_at IS NOT NULL AND connected_secs > 0`, userID).Scan(&avgDuration) //nolint:errcheck
+
+	// ── Country breakdown (active sessions) ─────────────────────────────────
+	// If no active sessions, fall back to today's DB rows.
+	if len(countryCounts) == 0 {
+		rows, err := db.Query(`SELECT country_code, country_name, COUNT(DISTINCT ip_hash)
+			FROM listener_sessions WHERE user_id = $1 AND started_at >= $2
+			GROUP BY country_code, country_name ORDER BY 3 DESC LIMIT 20`, userID, dayStart)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var code, name string
+				var n int
+				if rows.Scan(&code, &name, &n) == nil {
+					countryCounts[code] = struct{ code, name string; n int }{code, name, n}
+				}
+			}
+		}
+	}
+
+	countries := make([]analyticsCountry, 0, len(countryCounts))
+	total := 0
+	for _, e := range countryCounts {
+		total += e.n
+	}
+	for _, e := range countryCounts {
+		pct := 0.0
+		if total > 0 {
+			pct = float64(e.n) / float64(total) * 100
+		}
+		countries = append(countries, analyticsCountry{Code: e.code, Name: e.name, Count: e.n, Pct: pct})
+	}
+	// Sort by count desc.
+	for i := 0; i < len(countries); i++ {
+		for j := i + 1; j < len(countries); j++ {
+			if countries[j].Count > countries[i].Count {
+				countries[i], countries[j] = countries[j], countries[i]
+			}
+		}
+	}
+
+	// ── 6-week chart (weekly unique listeners) ───────────────────────────────
+	chartLabels := make([]string, 6)
+	chartData := make([]int, 6)
+	for i := 0; i < 6; i++ {
+		wStart := weeksAgo6.AddDate(0, 0, i*7)
+		wEnd := wStart.AddDate(0, 0, 7)
+		label := wStart.Format("Jan 2")
+		chartLabels[i] = label
+		var n int
+		db.QueryRow(`SELECT COUNT(DISTINCT ip_hash) FROM listener_sessions
+			WHERE user_id = $1 AND started_at >= $2 AND started_at < $3`,
+			userID, wStart, wEnd).Scan(&n) //nolint:errcheck
+		chartData[i] = n
+	}
+
+	// ── Raw sample (latest 5 open sessions) ──────────────────────────────────
+	type rawRow struct {
+		CountryCode string    `json:"country_code"`
+		CountryName string    `json:"country_name"`
+		ConnSecs    int       `json:"connected_secs"`
+		StartedAt   time.Time `json:"started_at"`
+	}
+	var rawRows []rawRow
+	if rows, err := db.Query(`SELECT country_code, country_name, connected_secs, started_at
+		FROM listener_sessions WHERE user_id = $1
+		ORDER BY last_seen_at DESC LIMIT 5`, userID); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var rr rawRow
+			if rows.Scan(&rr.CountryCode, &rr.CountryName, &rr.ConnSecs, &rr.StartedAt) == nil {
+				rawRows = append(rawRows, rr)
+			}
+		}
+	}
+	rawJSON, _ := json.Marshal(rawRows)
+
+	resp := analyticsResponse{
+		LiveCount:       liveCount,
+		DailySessions:   dailySessions,
+		MonthlySessions: monthlySessions,
+		AvgDurationSecs: avgDuration,
+		Countries:       countries,
+		ChartLabels:     chartLabels,
+		ChartData:       chartData,
+		RawSample:       json.RawMessage(rawJSON),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // generateKey returns a cryptographically random 32-character hex string.
@@ -2193,6 +2631,10 @@ func main() {
 	// Start RTMP ingest server on :1935
 	go startRTMPServer(streams)
 
+	// GeoIP + Icecast analytics worker.
+	initGeoIP()
+	startAnalyticsWorker()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -2205,6 +2647,7 @@ func main() {
 
 	// HTTP routes
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/analytics", requireAuth(handleAnalytics))
 	mux.HandleFunc("/api/conference/token", handleConferenceToken)
 	mux.HandleFunc("/api/health", handleHealth)
 	mux.HandleFunc("/api/config", handleConfig)
