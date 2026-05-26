@@ -644,7 +644,16 @@ var (
 func startAnalyticsWorker() {
 	icecastBase := os.Getenv("ICECAST_URL")
 	if icecastBase == "" {
-		icecastBase = "http://localhost:8000"
+		// Fall back to ICECAST_HOST + ICECAST_PORT (set in docker-compose/Railway).
+		host := os.Getenv("ICECAST_HOST")
+		if host == "" {
+			host = "localhost"
+		}
+		port := os.Getenv("ICECAST_PORT")
+		if port == "" {
+			port = "8000"
+		}
+		icecastBase = "http://" + host + ":" + port
 	}
 	icecastUser := os.Getenv("ICECAST_ADMIN_USER")
 	if icecastUser == "" {
@@ -668,9 +677,11 @@ func startAnalyticsWorker() {
 }
 
 // pollAllMounts fetches live mounts from the DB and polls each one.
+// We poll all stations (not just is_live=true) so a stale flag doesn't
+// cause listener counts to silently stay at 0.
 func pollAllMounts(client *http.Client, base, user, pass string) {
 	rows, err := db.Query(`SELECT u.id, u.stream_key FROM users u
-		JOIN stations s ON s.user_id = u.id WHERE s.is_live = true`)
+		JOIN stations s ON s.user_id = u.id WHERE u.stream_key IS NOT NULL AND u.stream_key <> ''`)
 	if err != nil {
 		return
 	}
