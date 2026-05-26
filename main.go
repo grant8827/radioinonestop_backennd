@@ -683,6 +683,7 @@ func pollAllMounts(client *http.Client, base, user, pass string) {
 	rows, err := db.Query(`SELECT u.id, u.stream_key FROM users u
 		JOIN stations s ON s.user_id = u.id WHERE u.stream_key IS NOT NULL AND u.stream_key <> ''`)
 	if err != nil {
+		log.Printf("[analytics] pollAllMounts DB error: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -695,6 +696,7 @@ func pollAllMounts(client *http.Client, base, user, pass string) {
 			live = append(live, mu)
 		}
 	}
+	log.Printf("[analytics] polling %d mount(s) via %s", len(live), base)
 
 	// For users no longer live, close their open sessions.
 	activeSessionsMu.Lock()
@@ -719,28 +721,34 @@ func pollMount(client *http.Client, base, user, pass, userID, streamKey string) 
 	reqURL := base + "/admin/listclients?mount=" + url.QueryEscape(mount)
 	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
+		log.Printf("[analytics] pollMount build request error: %v", err)
 		return
 	}
 	req.SetBasicAuth(user, pass)
 
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("[analytics] pollMount GET %s error: %v", reqURL, err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("[analytics] pollMount GET %s status %d", reqURL, resp.StatusCode)
 		return
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("[analytics] pollMount read body error: %v", err)
 		return
 	}
 
 	var stats icecastXML
 	if err := xml.Unmarshal(body, &stats); err != nil {
+		log.Printf("[analytics] pollMount XML parse error: %v — body: %s", err, string(body))
 		return
 	}
+	log.Printf("[analytics] mount=%s sources=%d", mount, len(stats.Sources))
 
 	// Collect current IPs from this poll.
 	currentIPs := map[string]int{} // ipHash → connected_secs
