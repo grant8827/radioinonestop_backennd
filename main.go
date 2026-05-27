@@ -531,6 +531,16 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
+	// Migrate: add columns that may be missing if the table was created by an older build.
+	for _, col := range []struct{ name, def string }{
+		{"country_code", "TEXT NOT NULL DEFAULT 'XX'"},
+		{"country_name", "TEXT NOT NULL DEFAULT 'Unknown'"},
+		{"ended_at", "TIMESTAMPTZ"},
+		{"connected_secs", "INTEGER NOT NULL DEFAULT 0"},
+		{"last_seen_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"},
+	} {
+		_, _ = db.Exec(`ALTER TABLE listener_sessions ADD COLUMN IF NOT EXISTS ` + col.name + ` ` + col.def)
+	}
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS listener_hourly (
 			user_id        TEXT NOT NULL,
@@ -613,6 +623,22 @@ func hashIP(ip string) string {
 	return hex.EncodeToString(h[:])
 }
 
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
+			return first
+		}
+	}
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 func icecastListenerCountForUser(userID string) int {
 	activeSessionsMu.Lock()
 	defer activeSessionsMu.Unlock()
@@ -643,18 +669,36 @@ func syncLiveListenerCount(userID string) {
 	_, _ = db.Exec(`UPDATE stations SET current_listeners_count = $1 WHERE user_id = $2`, count, userID)
 }
 
-func registerWebListener(userID, slug string, ttl time.Duration) (string, error) {
+func registerWebListener(userID, slug, ip string, ttl time.Duration) (string, error) {
 	sessionID, err := generateKey()
 	if err != nil {
 		return "", err
 	}
-	sess := &webListenerSession{userID: userID, slug: slug}
+	ipHash := hashIP(ip)
+	countryCode, countryName := resolveCountry(ip)
+	now := time.Now()
+	sess := &webListenerSession{
+		sessionID:   sessionID,
+		userID:      userID,
+		slug:        slug,
+		ipHash:      ipHash,
+		countryCode: countryCode,
+		countryName: countryName,
+		startedAt:   now,
+	}
 	if ttl > 0 {
-		sess.expiresAt = time.Now().Add(ttl)
+		sess.expiresAt = now.Add(ttl)
 	}
 	webListenerSessionsMu.Lock()
 	webListenerSessions[sessionID] = sess
 	webListenerSessionsMu.Unlock()
+	if _, dbErr := db.Exec(`
+		INSERT INTO listener_sessions (id, user_id, mount, ip_hash, country_code, country_name, started_at, last_seen_at, connected_secs)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), 0)
+		ON CONFLICT (id) DO NOTHING
+	`, sessionID, userID, "/web/"+slug, ipHash, countryCode, countryName); dbErr != nil {
+		log.Printf("[db] listener_sessions INSERT failed (web): %v", dbErr)
+	}
 	syncLiveListenerCount(userID)
 	return sessionID, nil
 }
@@ -665,7 +709,14 @@ func touchWebListener(sessionID string, ttl time.Duration) bool {
 	if ok && ttl > 0 {
 		sess.expiresAt = time.Now().Add(ttl)
 	}
+	connSecs := 0
+	if ok {
+		connSecs = int(time.Since(sess.startedAt).Seconds())
+	}
 	webListenerSessionsMu.Unlock()
+	if ok {
+		go db.Exec(`UPDATE listener_sessions SET last_seen_at = NOW(), connected_secs = $1 WHERE id = $2`, connSecs, sessionID) //nolint:errcheck
+	}
 	return ok
 }
 
@@ -684,6 +735,8 @@ func unregisterWebListener(sessionID string) {
 	}
 	webListenerSessionsMu.Unlock()
 	if ok {
+		connSecs := int(time.Since(sess.startedAt).Seconds())
+		_, _ = db.Exec(`UPDATE listener_sessions SET ended_at = NOW(), last_seen_at = NOW(), connected_secs = $1 WHERE id = $2`, connSecs, sessionID)
 		syncLiveListenerCount(sess.userID)
 	}
 }
@@ -695,14 +748,19 @@ func startWebListenerCleanup() {
 		for range ticker.C {
 			now := time.Now()
 			affected := map[string]bool{}
+			expired := map[string]int{}
 			webListenerSessionsMu.Lock()
 			for id, sess := range webListenerSessions {
 				if !sess.expiresAt.IsZero() && now.After(sess.expiresAt) {
 					affected[sess.userID] = true
+					expired[id] = int(now.Sub(sess.startedAt).Seconds())
 					delete(webListenerSessions, id)
 				}
 			}
 			webListenerSessionsMu.Unlock()
+			for id, connSecs := range expired {
+				_, _ = db.Exec(`UPDATE listener_sessions SET ended_at = NOW(), last_seen_at = NOW(), connected_secs = $1 WHERE id = $2`, connSecs, id)
+			}
 			for userID := range affected {
 				syncLiveListenerCount(userID)
 			}
@@ -734,9 +792,14 @@ type activeSession struct {
 
 // webListenerSession tracks listeners served through the app player/HLS paths.
 type webListenerSession struct {
-	userID    string
-	slug      string
-	expiresAt time.Time // zero means tied to an open HTTP stream
+	sessionID   string
+	userID      string
+	slug        string
+	ipHash      string
+	countryCode string
+	countryName string
+	startedAt   time.Time
+	expiresAt   time.Time // zero means tied to an open HTTP stream
 }
 
 var (
@@ -928,11 +991,15 @@ func upsertSession(userID, mount, ipHash, countryCode, countryName string, connS
 		startedAt:   time.Now(),
 	}
 	activeSessions[userID][ipHash] = sess
-	go db.Exec(` //nolint:errcheck
-		INSERT INTO listener_sessions (id, user_id, mount, ip_hash, country_code, country_name, started_at, last_seen_at, connected_secs)
-		VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), $7)
-		ON CONFLICT (id) DO NOTHING
-	`, sessionID, userID, mount, ipHash, countryCode, countryName, 0)
+	go func() {
+		if _, dbErr := db.Exec(`
+			INSERT INTO listener_sessions (id, user_id, mount, ip_hash, country_code, country_name, started_at, last_seen_at, connected_secs)
+			VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), $7)
+			ON CONFLICT (id) DO NOTHING
+		`, sessionID, userID, mount, ipHash, countryCode, countryName, 0); dbErr != nil {
+			log.Printf("[db] listener_sessions INSERT failed (icecast): %v", dbErr)
+		}
+	}()
 }
 
 func closeAllSessions(userID string) {
@@ -957,6 +1024,7 @@ type analyticsResponse struct {
 	LiveCount       int                `json:"live_count"`
 	DailySessions   int                `json:"daily_sessions"`
 	MonthlySessions int                `json:"monthly_sessions"`
+	TotalListeners  int                `json:"total_listeners"`
 	AvgDurationSecs float64            `json:"avg_duration_secs"`
 	Countries       []analyticsCountry `json:"countries"`
 	ChartLabels     []string           `json:"chart_labels"`
@@ -986,6 +1054,18 @@ func handleAnalytics(w http.ResponseWriter, r *http.Request) {
 		countryCounts[sess.countryCode] = e
 	}
 	activeSessionsMu.Unlock()
+	webListenerSessionsMu.Lock()
+	for _, sess := range webListenerSessions {
+		if sess.userID != userID {
+			continue
+		}
+		e := countryCounts[sess.countryCode]
+		e.code = sess.countryCode
+		e.name = sess.countryName
+		e.n++
+		countryCounts[sess.countryCode] = e
+	}
+	webListenerSessionsMu.Unlock()
 	liveCount := totalLiveListenerCount(userID)
 
 	now := time.Now().UTC()
@@ -1003,10 +1083,15 @@ func handleAnalytics(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow(`SELECT COUNT(DISTINCT ip_hash) FROM listener_sessions
 		WHERE user_id = $1 AND started_at >= $2`, userID, monthStart).Scan(&monthlySessions) //nolint:errcheck
 
-	// ── Avg duration (completed sessions only) ──────────────────────────────
+	// ── Total unique listeners ──────────────────────────────────────────────
+	var totalListeners int
+	db.QueryRow(`SELECT COUNT(DISTINCT ip_hash) FROM listener_sessions
+		WHERE user_id = $1`, userID).Scan(&totalListeners) //nolint:errcheck
+
+	// ── Avg duration ────────────────────────────────────────────────────────
 	var avgDuration float64
 	db.QueryRow(`SELECT COALESCE(AVG(connected_secs), 0) FROM listener_sessions
-		WHERE user_id = $1 AND ended_at IS NOT NULL AND connected_secs > 0`, userID).Scan(&avgDuration) //nolint:errcheck
+		WHERE user_id = $1 AND connected_secs > 0`, userID).Scan(&avgDuration) //nolint:errcheck
 
 	// ── Country breakdown (active sessions) ─────────────────────────────────
 	// If no active sessions, fall back to today's DB rows.
@@ -1090,6 +1175,7 @@ func handleAnalytics(w http.ResponseWriter, r *http.Request) {
 		LiveCount:       liveCount,
 		DailySessions:   dailySessions,
 		MonthlySessions: monthlySessions,
+		TotalListeners:  totalListeners,
 		AvgDurationSecs: avgDuration,
 		Countries:       countries,
 		ChartLabels:     chartLabels,
@@ -2340,7 +2426,7 @@ func handleListenerSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		sessionID, err := registerWebListener(userID, slug, 30*time.Second)
+		sessionID, err := registerWebListener(userID, slug, clientIP(r), 30*time.Second)
 		if err != nil {
 			http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
 			return
@@ -2494,7 +2580,7 @@ func handleListen(w http.ResponseWriter, r *http.Request) {
 	if existingSessionID != "" && webListenerMatches(existingSessionID, slug) {
 		touchWebListener(existingSessionID, 30*time.Second)
 	} else {
-		sessionID, err := registerWebListener(userID, slug, 0)
+		sessionID, err := registerWebListener(userID, slug, clientIP(r), 0)
 		if err == nil {
 			defer unregisterWebListener(sessionID)
 		}
