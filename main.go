@@ -568,6 +568,24 @@ func initDB(dsn string) error {
 			return err
 		}
 	}
+	// OAuth platform connections table.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS oauth_connections (
+			id            TEXT PRIMARY KEY,
+			user_id       TEXT NOT NULL,
+			platform      TEXT NOT NULL,
+			access_token  TEXT NOT NULL,
+			refresh_token TEXT NOT NULL DEFAULT '',
+			expires_at    TIMESTAMPTZ,
+			scope         TEXT NOT NULL DEFAULT '',
+			connected_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			UNIQUE(user_id, platform)
+		)
+	`)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2900,6 +2918,365 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, abs)
 }
 
+// ─── OAuth 2.0 — Platform Connection (Login-to-Stream) ───────────────────────
+
+// oauthStateEntry holds data associated with a short-lived CSRF state token.
+type oauthStateEntry struct {
+	UserID    string
+	Platform  string
+	ExpiresAt time.Time
+}
+
+// oauthStates stores pending state tokens keyed by the random state string.
+// Entries expire after 10 minutes; cleanup is lazy (checked on access).
+var oauthStates sync.Map // string → oauthStateEntry
+
+// oauthPlatformConfig defines per-platform OAuth2 settings.
+type oauthPlatformConfig struct {
+	AuthURL         string
+	TokenURL        string
+	Scopes          string
+	ClientID        func() string
+	ClientSecret    func() string
+	ExtraAuthParams url.Values // appended to the authorization redirect URL
+}
+
+// supportedOAuthPlatforms is the registry of platforms that support OAuth
+// Login-to-Stream. Credentials are read from environment variables at
+// runtime so the map can be initialised at package level.
+var supportedOAuthPlatforms = map[string]oauthPlatformConfig{
+	"twitch": {
+		AuthURL:      "https://id.twitch.tv/oauth2/authorize",
+		TokenURL:     "https://id.twitch.tv/oauth2/token",
+		Scopes:       "channel:manage:broadcast",
+		ClientID:     func() string { return os.Getenv("TWITCH_CLIENT_ID") },
+		ClientSecret: func() string { return os.Getenv("TWITCH_CLIENT_SECRET") },
+	},
+	"youtube": {
+		AuthURL:  "https://accounts.google.com/o/oauth2/v2/auth",
+		TokenURL: "https://oauth2.googleapis.com/token",
+		Scopes:   "https://www.googleapis.com/auth/youtube.force-ssl",
+		ExtraAuthParams: url.Values{
+			"access_type": {"offline"},
+			"prompt":      {"consent"},
+		},
+		ClientID:     func() string { return os.Getenv("YOUTUBE_CLIENT_ID") },
+		ClientSecret: func() string { return os.Getenv("YOUTUBE_CLIENT_SECRET") },
+	},
+	"facebook": {
+		AuthURL:      "https://www.facebook.com/v20.0/dialog/oauth",
+		TokenURL:     "https://graph.facebook.com/v20.0/oauth/access_token",
+		Scopes:       "publish_video,pages_manage_posts",
+		ClientID:     func() string { return os.Getenv("FACEBOOK_APP_ID") },
+		ClientSecret: func() string { return os.Getenv("FACEBOOK_APP_SECRET") },
+	},
+	"tiktok": {
+		AuthURL:      "https://www.tiktok.com/v2/auth/authorize/",
+		TokenURL:     "https://open.tiktokapis.com/v2/oauth/token/",
+		Scopes:       "user.info.basic,video.publish",
+		ClientID:     func() string { return os.Getenv("TIKTOK_CLIENT_KEY") },
+		ClientSecret: func() string { return os.Getenv("TIKTOK_CLIENT_SECRET") },
+	},
+	"instagram": {
+		AuthURL:      "https://api.instagram.com/oauth/authorize",
+		TokenURL:     "https://api.instagram.com/oauth/access_token",
+		Scopes:       "user_profile,user_media",
+		ClientID:     func() string { return os.Getenv("INSTAGRAM_APP_ID") },
+		ClientSecret: func() string { return os.Getenv("INSTAGRAM_APP_SECRET") },
+	},
+	"x": {
+		AuthURL:      "https://twitter.com/i/oauth2/authorize",
+		TokenURL:     "https://api.twitter.com/2/oauth2/token",
+		Scopes:       "tweet.write media.write offline.access",
+		ClientID:     func() string { return os.Getenv("X_CLIENT_ID") },
+		ClientSecret: func() string { return os.Getenv("X_CLIENT_SECRET") },
+	},
+	"linkedin": {
+		AuthURL:      "https://www.linkedin.com/oauth/v2/authorization",
+		TokenURL:     "https://www.linkedin.com/oauth/v2/accessToken",
+		Scopes:       "w_member_social rw_organizationAdmin",
+		ClientID:     func() string { return os.Getenv("LINKEDIN_CLIENT_ID") },
+		ClientSecret: func() string { return os.Getenv("LINKEDIN_CLIENT_SECRET") },
+	},
+}
+
+// appBaseURL returns the backend's public base URL used to construct OAuth
+// redirect URIs. Defaults to localhost:8080 for local development.
+func appBaseURL() string {
+	if v := os.Getenv("APP_BASE_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://localhost:8080"
+}
+
+// frontendURL returns the frontend's public base URL used to redirect the
+// browser after a successful or failed OAuth callback.
+func frontendURL() string {
+	if v := os.Getenv("FRONTEND_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://localhost:5173"
+}
+
+// handleOAuthRoute is registered under /api/auth/ and dispatches to either
+// handleOAuthConnect (POST …/{platform}/connect) or
+// handleOAuthCallback (GET …/{platform}/callback).
+func handleOAuthRoute(w http.ResponseWriter, r *http.Request) {
+	// Strip prefix → e.g. "twitch/connect" or "twitch/callback"
+	tail := strings.TrimPrefix(r.URL.Path, "/api/auth/")
+	tail = strings.Trim(tail, "/")
+	parts := strings.SplitN(tail, "/", 2)
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+	platform, action := parts[0], parts[1]
+
+	// Ensure platform is known before touching auth.
+	if _, ok := supportedOAuthPlatforms[platform]; !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch action {
+	case "connect":
+		// Requires a valid JWT Bearer token (user must be logged in).
+		authHdr := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authHdr, "Bearer ") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		claims, err := jwtVerify(strings.TrimPrefix(authHdr, "Bearer "))
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), contextKeyUserID, claims.UserID)
+		handleOAuthConnect(w, r.WithContext(ctx), platform)
+	case "callback":
+		// No JWT — browser redirect. User is identified via state token.
+		handleOAuthCallback(w, r, platform)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// handleOAuthConnect initiates the OAuth2 Authorization Code flow.
+// POST /api/auth/{platform}/connect
+// Returns {"redirect_url": "https://..."} for the client to navigate to.
+func handleOAuthConnect(w http.ResponseWriter, r *http.Request, platform string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg := supportedOAuthPlatforms[platform]
+	if cfg.ClientID() == "" {
+		http.Error(w, "platform not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	userID := r.Context().Value(contextKeyUserID).(string)
+
+	stateBytes := make([]byte, 16)
+	if _, err := rand.Read(stateBytes); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	state := hex.EncodeToString(stateBytes)
+	oauthStates.Store(state, oauthStateEntry{
+		UserID:    userID,
+		Platform:  platform,
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+	})
+
+	redirectURI := appBaseURL() + "/api/auth/" + platform + "/callback"
+	params := url.Values{}
+	params.Set("client_id", cfg.ClientID())
+	params.Set("redirect_uri", redirectURI)
+	params.Set("response_type", "code")
+	params.Set("scope", cfg.Scopes)
+	params.Set("state", state)
+	for k, vs := range cfg.ExtraAuthParams {
+		if len(vs) > 0 {
+			params.Set(k, vs[0])
+		}
+	}
+
+	authURL := cfg.AuthURL + "?" + params.Encode()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"redirect_url": authURL})
+}
+
+// handleOAuthCallback receives the provider redirect and exchanges the
+// authorization code for access/refresh tokens.
+// GET /api/auth/{platform}/callback?code=...&state=...
+func handleOAuthCallback(w http.ResponseWriter, r *http.Request, platform string) {
+	errRedirect := func(reason string) {
+		http.Redirect(w, r,
+			frontendURL()+"?oauth_error="+url.QueryEscape(reason)+"&platform="+platform,
+			http.StatusFound)
+	}
+
+	state := r.URL.Query().Get("state")
+	code := r.URL.Query().Get("code")
+	if state == "" || code == "" {
+		errRedirect("missing_params")
+		return
+	}
+
+	entryRaw, ok := oauthStates.LoadAndDelete(state)
+	if !ok {
+		errRedirect("invalid_state")
+		return
+	}
+	entry := entryRaw.(oauthStateEntry)
+	if time.Now().After(entry.ExpiresAt) || entry.Platform != platform {
+		errRedirect("expired_state")
+		return
+	}
+
+	redirectURI := appBaseURL() + "/api/auth/" + platform + "/callback"
+	tok, err := oauthExchangeCode(supportedOAuthPlatforms[platform], code, redirectURI)
+	if err != nil {
+		log.Printf("[oauth] token exchange failed platform=%s user=%s: %v", platform, entry.UserID, err)
+		errRedirect("token_exchange_failed")
+		return
+	}
+
+	connID, err := generateKey()
+	if err != nil {
+		errRedirect("server_error")
+		return
+	}
+	var expiresAt sql.NullTime
+	if tok.ExpiresIn > 0 {
+		expiresAt = sql.NullTime{
+			Time:  time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second),
+			Valid: true,
+		}
+	}
+	_, err = db.Exec(`
+		INSERT INTO oauth_connections (id, user_id, platform, access_token, refresh_token, expires_at, scope, connected_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+		ON CONFLICT (user_id, platform) DO UPDATE SET
+			access_token  = EXCLUDED.access_token,
+			refresh_token = EXCLUDED.refresh_token,
+			expires_at    = EXCLUDED.expires_at,
+			scope         = EXCLUDED.scope,
+			connected_at  = NOW()
+	`, connID, entry.UserID, platform, tok.AccessToken, tok.RefreshToken, expiresAt, tok.Scope)
+	if err != nil {
+		log.Printf("[oauth] db upsert failed platform=%s user=%s: %v", platform, entry.UserID, err)
+		errRedirect("db_error")
+		return
+	}
+
+	log.Printf("[oauth] connected platform=%s user=%s", platform, entry.UserID)
+	http.Redirect(w, r, frontendURL()+"?oauth_success="+platform, http.StatusFound)
+}
+
+// oauthTokenResponse is the standard OAuth2 token endpoint response.
+type oauthTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int    `json:"expires_in"`
+	Scope        string `json:"scope"`
+	TokenType    string `json:"token_type"`
+}
+
+// oauthExchangeCode exchanges an authorization code for tokens via
+// application/x-www-form-urlencoded POST (standard for most providers).
+func oauthExchangeCode(cfg oauthPlatformConfig, code, redirectURI string) (*oauthTokenResponse, error) {
+	params := url.Values{}
+	params.Set("grant_type", "authorization_code")
+	params.Set("code", code)
+	params.Set("redirect_uri", redirectURI)
+	params.Set("client_id", cfg.ClientID())
+	params.Set("client_secret", cfg.ClientSecret())
+
+	resp, err := http.PostForm(cfg.TokenURL, params)
+	if err != nil {
+		return nil, fmt.Errorf("POST %s: %w", cfg.TokenURL, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("token endpoint %s returned %d: %s", cfg.TokenURL, resp.StatusCode, string(body))
+	}
+	var tok oauthTokenResponse
+	if err := json.Unmarshal(body, &tok); err != nil {
+		return nil, fmt.Errorf("parse token response: %w", err)
+	}
+	return &tok, nil
+}
+
+// handleOAuthConnections dispatches GET (list all connections) and
+// DELETE (remove by platform) for /api/user/oauth-connections[/{platform}].
+func handleOAuthConnections(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		handleGetOAuthConnections(w, r)
+	case http.MethodDelete:
+		handleDeleteOAuthConnection(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// GET /api/user/oauth-connections
+func handleGetOAuthConnections(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(contextKeyUserID).(string)
+	rows, err := db.Query(`
+		SELECT platform, connected_at, expires_at, scope
+		FROM oauth_connections
+		WHERE user_id = $1
+		ORDER BY platform
+	`, userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type connEntry struct {
+		Platform    string     `json:"platform"`
+		ConnectedAt time.Time  `json:"connected_at"`
+		ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+		Scope       string     `json:"scope"`
+	}
+	result := []connEntry{} // never nil — serialises as [] not null
+	for rows.Next() {
+		var e connEntry
+		var expiresAt sql.NullTime
+		if err := rows.Scan(&e.Platform, &e.ConnectedAt, &expiresAt, &e.Scope); err != nil {
+			continue
+		}
+		if expiresAt.Valid {
+			e.ExpiresAt = &expiresAt.Time
+		}
+		result = append(result, e)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// DELETE /api/user/oauth-connections/{platform}
+func handleDeleteOAuthConnection(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(contextKeyUserID).(string)
+	platform := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/user/oauth-connections"), "/")
+
+	if _, ok := supportedOAuthPlatforms[platform]; !ok {
+		http.Error(w, "unsupported platform", http.StatusBadRequest)
+		return
+	}
+	if _, err := db.Exec(`DELETE FROM oauth_connections WHERE user_id = $1 AND platform = $2`, userID, platform); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[oauth] disconnected platform=%s user=%s", platform, userID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 func main() {
@@ -2971,10 +3348,13 @@ func main() {
 	mux.HandleFunc("/ws/chat", handleChat)
 	mux.HandleFunc("/api/auth/register", handleRegister)
 	mux.HandleFunc("/api/auth/login", handleLogin)
+	mux.HandleFunc("/api/auth/", handleOAuthRoute) // platform OAuth connect + callback
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
 	mux.HandleFunc("/api/user/profile", requireAuth(handleUserProfile))
 	mux.HandleFunc("/api/user/password", requireAuth(handleChangePassword))
 	mux.HandleFunc("/api/user/account", requireAuth(handleDeleteAccount))
+	mux.HandleFunc("/api/user/oauth-connections", requireAuth(handleOAuthConnections))
+	mux.HandleFunc("/api/user/oauth-connections/", requireAuth(handleOAuthConnections))
 	mux.HandleFunc("/api/stations/", handleGetStation)
 	mux.HandleFunc("/api/icecast/auth", handleIcecastAuth)
 	mux.HandleFunc("/api/listeners/start", handleListenerSession)
