@@ -3277,6 +3277,279 @@ func handleDeleteOAuthConnection(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ─── OAuth Stage 4 — Stream Key Provisioning ─────────────────────────────────
+
+// oauthStreamDest is a stream destination auto-provisioned via OAuth.
+type oauthStreamDest struct {
+	Platform  string `json:"platform"`
+	Label     string `json:"label"`
+	ServerURL string `json:"server_url"`
+	StreamKey string `json:"stream_key"`
+}
+
+// refreshOAuthTokenIfNeeded checks whether the stored access token is expired
+// or close to expiry (within 5 minutes) and refreshes it if needed.
+// Returns the current valid access token.
+func refreshOAuthTokenIfNeeded(userID, platform string) (string, error) {
+	var accessToken, refreshToken string
+	var expiresAt sql.NullTime
+	err := db.QueryRow(`
+		SELECT access_token, refresh_token, expires_at
+		FROM oauth_connections
+		WHERE user_id = $1 AND platform = $2
+	`, userID, platform).Scan(&accessToken, &refreshToken, &expiresAt)
+	if err != nil {
+		return "", fmt.Errorf("no connection for platform %s: %w", platform, err)
+	}
+
+	// If no expiry stored, or token is still fresh (>5 min remaining), return as-is.
+	if !expiresAt.Valid || time.Until(expiresAt.Time) > 5*time.Minute {
+		return accessToken, nil
+	}
+
+	// Token is expired or about to expire — refresh it.
+	cfg, ok := supportedOAuthPlatforms[platform]
+	if !ok || refreshToken == "" {
+		return accessToken, nil // Can't refresh; try with the current token.
+	}
+
+	params := url.Values{}
+	params.Set("grant_type", "refresh_token")
+	params.Set("refresh_token", refreshToken)
+	params.Set("client_id", cfg.ClientID())
+	params.Set("client_secret", cfg.ClientSecret())
+
+	resp, err := http.PostForm(cfg.TokenURL, params)
+	if err != nil {
+		return accessToken, fmt.Errorf("refresh POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return accessToken, fmt.Errorf("refresh endpoint returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tok oauthTokenResponse
+	if err := json.Unmarshal(body, &tok); err != nil {
+		return accessToken, fmt.Errorf("parse refresh response: %w", err)
+	}
+
+	// Persist updated tokens.
+	var newExpiry sql.NullTime
+	if tok.ExpiresIn > 0 {
+		newExpiry = sql.NullTime{Time: time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second), Valid: true}
+	}
+	newRefresh := tok.RefreshToken
+	if newRefresh == "" {
+		newRefresh = refreshToken // some providers don't rotate the refresh token
+	}
+	_, _ = db.Exec(`
+		UPDATE oauth_connections
+		SET access_token = $1, refresh_token = $2, expires_at = $3
+		WHERE user_id = $4 AND platform = $5
+	`, tok.AccessToken, newRefresh, newExpiry, userID, platform)
+
+	log.Printf("[oauth] refreshed token platform=%s user=%s", platform, userID)
+	return tok.AccessToken, nil
+}
+
+// fetchTwitchStreamKey fetches the RTMP stream key for the authenticated Twitch user.
+func fetchTwitchStreamKey(accessToken, clientID string) (*oauthStreamDest, error) {
+	// Step 1: get the broadcaster's user ID and display name.
+	req, _ := http.NewRequest("GET", "https://api.twitch.tv/helix/users", nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Client-Id", clientID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("twitch users: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("twitch users %d: %s", resp.StatusCode, string(body))
+	}
+	var usersResp struct {
+		Data []struct {
+			ID          string `json:"id"`
+			DisplayName string `json:"display_name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &usersResp); err != nil || len(usersResp.Data) == 0 {
+		return nil, fmt.Errorf("twitch users parse: %w", err)
+	}
+	broadcasterID := usersResp.Data[0].ID
+	displayName := usersResp.Data[0].DisplayName
+
+	// Step 2: get the stream key.
+	req2, _ := http.NewRequest("GET", "https://api.twitch.tv/helix/streams/key?broadcaster_id="+broadcasterID, nil)
+	req2.Header.Set("Authorization", "Bearer "+accessToken)
+	req2.Header.Set("Client-Id", clientID)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		return nil, fmt.Errorf("twitch stream key: %w", err)
+	}
+	defer resp2.Body.Close()
+	body2, _ := io.ReadAll(resp2.Body)
+	if resp2.StatusCode >= 400 {
+		return nil, fmt.Errorf("twitch stream key %d: %s", resp2.StatusCode, string(body2))
+	}
+	var keyResp struct {
+		Data []struct {
+			StreamKey string `json:"stream_key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body2, &keyResp); err != nil || len(keyResp.Data) == 0 {
+		return nil, fmt.Errorf("twitch stream key parse: %w", err)
+	}
+
+	return &oauthStreamDest{
+		Platform:  "twitch",
+		Label:     "Twitch — " + displayName,
+		ServerURL: "rtmp://live.twitch.tv/app/",
+		StreamKey: keyResp.Data[0].StreamKey,
+	}, nil
+}
+
+// fetchYouTubeStreamKey fetches (or creates) a YouTube live stream and returns its RTMP credentials.
+func fetchYouTubeStreamKey(accessToken string) (*oauthStreamDest, error) {
+	// Step 1: try to get an existing persistent live stream.
+	req, _ := http.NewRequest("GET",
+		"https://www.googleapis.com/youtube/v3/liveStreams?mine=true&part=cdn,snippet&maxResults=1",
+		nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("youtube liveStreams list: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("youtube liveStreams %d: %s", resp.StatusCode, string(body))
+	}
+
+	type ytIngestion struct {
+		IngestionAddress string `json:"ingestionAddress"`
+		StreamName       string `json:"streamName"`
+	}
+	type ytCDN struct {
+		IngestionInfo ytIngestion `json:"ingestionInfo"`
+	}
+	type ytItem struct {
+		Snippet struct {
+			Title string `json:"title"`
+		} `json:"snippet"`
+		CDN ytCDN `json:"cdn"`
+	}
+	var listResp struct {
+		Items []ytItem `json:"items"`
+	}
+	if err := json.Unmarshal(body, &listResp); err != nil {
+		return nil, fmt.Errorf("youtube liveStreams parse: %w", err)
+	}
+
+	// Step 2: if none exist, create a new persistent stream.
+	var item ytItem
+	if len(listResp.Items) > 0 {
+		item = listResp.Items[0]
+	} else {
+		createBody := `{"snippet":{"title":"Radio In One Stop"},"cdn":{"format":"1080p","frameRate":"variable","ingestionType":"rtmp"}}`
+		req2, _ := http.NewRequest("POST",
+			"https://www.googleapis.com/youtube/v3/liveStreams?part=cdn,snippet",
+			strings.NewReader(createBody))
+		req2.Header.Set("Authorization", "Bearer "+accessToken)
+		req2.Header.Set("Content-Type", "application/json")
+		resp2, err := http.DefaultClient.Do(req2)
+		if err != nil {
+			return nil, fmt.Errorf("youtube liveStreams create: %w", err)
+		}
+		defer resp2.Body.Close()
+		body2, _ := io.ReadAll(resp2.Body)
+		if resp2.StatusCode >= 400 {
+			return nil, fmt.Errorf("youtube liveStreams create %d: %s", resp2.StatusCode, string(body2))
+		}
+		if err := json.Unmarshal(body2, &item); err != nil {
+			return nil, fmt.Errorf("youtube liveStreams create parse: %w", err)
+		}
+	}
+
+	if item.CDN.IngestionInfo.StreamName == "" {
+		return nil, fmt.Errorf("youtube: no stream key in response")
+	}
+
+	return &oauthStreamDest{
+		Platform:  "youtube",
+		Label:     "YouTube Live",
+		ServerURL: item.CDN.IngestionInfo.IngestionAddress,
+		StreamKey: item.CDN.IngestionInfo.StreamName,
+	}, nil
+}
+
+// POST /api/user/oauth-stream-keys/sync
+// For each connected platform with a valid/refreshable token, fetches the
+// RTMP credentials from the platform API and returns them so the frontend can
+// inject them into the multistream destinations list.
+func handleSyncOAuthStreamKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID := r.Context().Value(contextKeyUserID).(string)
+
+	// Load all connected platforms for this user.
+	rows, err := db.Query(`SELECT platform FROM oauth_connections WHERE user_id = $1`, userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var platforms []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err == nil {
+			platforms = append(platforms, p)
+		}
+	}
+
+	type syncResult struct {
+		Platform string           `json:"platform"`
+		Dest     *oauthStreamDest `json:"dest,omitempty"`
+		Error    string           `json:"error,omitempty"`
+	}
+
+	results := make([]syncResult, 0, len(platforms))
+
+	for _, platform := range platforms {
+		accessToken, err := refreshOAuthTokenIfNeeded(userID, platform)
+		if err != nil {
+			results = append(results, syncResult{Platform: platform, Error: err.Error()})
+			continue
+		}
+
+		var dest *oauthStreamDest
+		switch platform {
+		case "twitch":
+			clientID := supportedOAuthPlatforms["twitch"].ClientID()
+			dest, err = fetchTwitchStreamKey(accessToken, clientID)
+		case "youtube":
+			dest, err = fetchYouTubeStreamKey(accessToken)
+		default:
+			err = fmt.Errorf("stream key provisioning for %s not yet implemented", platform)
+		}
+
+		if err != nil {
+			log.Printf("[oauth] sync failed platform=%s user=%s: %v", platform, userID, err)
+			results = append(results, syncResult{Platform: platform, Error: err.Error()})
+		} else {
+			log.Printf("[oauth] synced stream key platform=%s user=%s", platform, userID)
+			results = append(results, syncResult{Platform: platform, Dest: dest})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(results)
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 func main() {
@@ -3355,6 +3628,7 @@ func main() {
 	mux.HandleFunc("/api/user/account", requireAuth(handleDeleteAccount))
 	mux.HandleFunc("/api/user/oauth-connections", requireAuth(handleOAuthConnections))
 	mux.HandleFunc("/api/user/oauth-connections/", requireAuth(handleOAuthConnections))
+	mux.HandleFunc("/api/user/oauth-stream-keys/sync", requireAuth(handleSyncOAuthStreamKeys))
 	mux.HandleFunc("/api/stations/", handleGetStation)
 	mux.HandleFunc("/api/icecast/auth", handleIcecastAuth)
 	mux.HandleFunc("/api/listeners/start", handleListenerSession)
