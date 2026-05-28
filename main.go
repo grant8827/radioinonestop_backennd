@@ -3310,6 +3310,152 @@ func handleDeleteOAuthConnection(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ─── Stage 5 — WebRTC relay (browser Go Live → platform RTMP) ────────────────
+//
+// When the user streams via browser (WebRTC WHIP → MediaMTX), the traditional
+// RTMP relay never fires. These handlers let the frontend trigger an FFmpeg
+// relay that pulls the stream from MediaMTX via RTSP and forwards it to the
+// user's active destinations, just like the OBS/RTMP path.
+
+// mediamtxRTSPBase returns the base RTSP URL for MediaMTX.
+// Defaults to rtsp://mediamtx:8554 (Docker Compose internal hostname).
+func mediamtxRTSPBase() string {
+	base := os.Getenv("MEDIAMTX_RTSP_URL")
+	if base == "" {
+		base = "rtsp://mediamtx:8554"
+	}
+	return strings.TrimRight(base, "/")
+}
+
+// webRelayManager maps userID → running relay cancel function.
+type webRelayManager struct {
+	mu     sync.Mutex
+	relays map[string]context.CancelFunc
+}
+
+var webRelay = &webRelayManager{relays: make(map[string]context.CancelFunc)}
+
+// POST /api/stream/relay/start
+// Body: {"path": "<mediamtx-path>"} — the path the browser published to via WHIP.
+// Spawns an FFmpeg process that pulls from RTSP and forwards to all active
+// destinations for the authenticated user.
+func handleRelayStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID := r.Context().Value(contextKeyUserID).(string)
+
+	var body struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Path == "" {
+		http.Error(w, "path required", http.StatusBadRequest)
+		return
+	}
+
+	// Load active destinations for this user.
+	rows, err := db.Query(`
+		SELECT rtmp_url, stream_key FROM destinations
+		WHERE user_id = $1 AND enabled = 1 AND stream_key != '' AND rtmp_url != ''
+	`, userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var dests []string
+	for rows.Next() {
+		var rtmpURL, key string
+		if err := rows.Scan(&rtmpURL, &key); err == nil {
+			dests = append(dests, strings.TrimRight(rtmpURL, "/")+"/"+strings.TrimLeft(key, "/"))
+		}
+	}
+
+	if len(dests) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"relaying": false,
+			"reason":   "no active destinations",
+		})
+		return
+	}
+
+	// Build FFmpeg args: pull via RTSP, stream-copy to each destination.
+	rtspSrc := mediamtxRTSPBase() + "/" + body.Path
+	args := []string{
+		"-rtsp_transport", "tcp",
+		"-i", rtspSrc,
+	}
+	for _, dest := range dests {
+		args = append(args, "-c:v", "copy", "-c:a", "copy", "-f", "flv", dest)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		log.Printf("[relay] start error user=%s: %v", userID, err)
+		http.Error(w, "relay start failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Replace any previous relay for this user.
+	webRelay.mu.Lock()
+	if old, ok := webRelay.relays[userID]; ok {
+		old()
+	}
+	webRelay.relays[userID] = cancel
+	webRelay.mu.Unlock()
+
+	// Watch the process; clean up when it exits.
+	go func() {
+		defer cancel()
+		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+			log.Printf("[relay] FFmpeg exited user=%s path=%s: %v", userID, body.Path, err)
+		}
+		webRelay.mu.Lock()
+		if webRelay.relays[userID] != nil {
+			delete(webRelay.relays, userID)
+		}
+		webRelay.mu.Unlock()
+	}()
+
+	log.Printf("[relay] started user=%s path=%s destinations=%d", userID, body.Path, len(dests))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":       "ok",
+		"relaying":     true,
+		"destinations": len(dests),
+	})
+}
+
+// POST /api/stream/relay/stop
+// Kills the running FFmpeg relay for the authenticated user.
+func handleRelayStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID := r.Context().Value(contextKeyUserID).(string)
+
+	webRelay.mu.Lock()
+	cancel, ok := webRelay.relays[userID]
+	if ok {
+		cancel()
+		delete(webRelay.relays, userID)
+	}
+	webRelay.mu.Unlock()
+
+	log.Printf("[relay] stopped user=%s (was_running=%v)", userID, ok)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ─── OAuth Stage 4 — Stream Key Provisioning ─────────────────────────────────
 
 // oauthStreamDest is a stream destination auto-provisioned via OAuth.
@@ -3662,6 +3808,8 @@ func main() {
 	mux.HandleFunc("/api/user/oauth-connections", requireAuth(handleOAuthConnections))
 	mux.HandleFunc("/api/user/oauth-connections/", requireAuth(handleOAuthConnections))
 	mux.HandleFunc("/api/user/oauth-stream-keys/sync", requireAuth(handleSyncOAuthStreamKeys))
+	mux.HandleFunc("/api/stream/relay/start", requireAuth(handleRelayStart))
+	mux.HandleFunc("/api/stream/relay/stop", requireAuth(handleRelayStop))
 	mux.HandleFunc("/api/stations/", handleGetStation)
 	mux.HandleFunc("/api/icecast/auth", handleIcecastAuth)
 	mux.HandleFunc("/api/listeners/start", handleListenerSession)
