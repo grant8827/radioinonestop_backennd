@@ -586,6 +586,15 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
+
+	// ── Schema migrations (idempotent) ─────────────────────────────────────
+	// Add label column to destinations if not present (Stage 5).
+	_, _ = db.Exec(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS label TEXT NOT NULL DEFAULT ''`)
+	// Add serverUrl alias column so we can store RTMP base URL directly.
+	_, _ = db.Exec(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS server_url TEXT NOT NULL DEFAULT ''`)
+	// Drop old UNIQUE(user_id, platform) to allow multiple destinations per platform.
+	_, _ = db.Exec(`ALTER TABLE destinations DROP CONSTRAINT IF EXISTS destinations_user_id_platform_key`)
+
 	return nil
 }
 
@@ -1795,7 +1804,7 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(
-		`SELECT platform, rtmp_url, stream_key, enabled FROM destinations WHERE user_id = $1 ORDER BY platform`,
+		`SELECT id, platform, label, rtmp_url, stream_key, enabled FROM destinations WHERE user_id = $1 ORDER BY updated_at`,
 		userID,
 	)
 	if err != nil {
@@ -1803,20 +1812,23 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
+	// Return new camelCase format so migrateChannel() passes through unchanged.
 	type destResp struct {
+		ID        string `json:"id"`
 		Platform  string `json:"platform"`
-		RTMPUrl   string `json:"rtmp_url"`
-		StreamKey string `json:"stream_key"`
-		Enabled   bool   `json:"enabled"`
+		Label     string `json:"label"`
+		ServerURL string `json:"serverUrl"`
+		StreamKey string `json:"streamKey"`
+		Active    bool   `json:"active"`
 	}
 	var dests []destResp
 	for rows.Next() {
 		var d destResp
 		var enabled int
-		if err := rows.Scan(&d.Platform, &d.RTMPUrl, &d.StreamKey, &enabled); err != nil {
+		if err := rows.Scan(&d.ID, &d.Platform, &d.Label, &d.ServerURL, &d.StreamKey, &enabled); err != nil {
 			continue
 		}
-		d.Enabled = enabled == 1
+		d.Active = enabled == 1
 		dests = append(dests, d)
 	}
 	if dests == nil {
@@ -1839,14 +1851,18 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 
 // handleSaveCredentials upserts external platform stream keys for the current user.
 // PUT /api/user/stream-credentials
-// Body: {"destinations": [{"platform": "youtube", "stream_key": "...", "enabled": true}]}
+// Body: {"destinations": [{id, platform, label, serverUrl, streamKey, active}]}
+// Replaces all destinations for the user atomically (DELETE + INSERT in a transaction).
 func handleSaveCredentials(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(contextKeyUserID).(string)
 	var body struct {
 		Destinations []struct {
+			ID        string `json:"id"`
 			Platform  string `json:"platform"`
-			StreamKey string `json:"stream_key"`
-			Enabled   bool   `json:"enabled"`
+			Label     string `json:"label"`
+			ServerURL string `json:"serverUrl"`
+			StreamKey string `json:"streamKey"`
+			Active    bool   `json:"active"`
 		} `json:"destinations"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1859,26 +1875,41 @@ func handleSaveCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+
+	// Delete all existing destinations for this user and re-insert fresh.
+	if _, err := tx.Exec(`DELETE FROM destinations WHERE user_id = $1`, userID); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
 	for _, d := range body.Destinations {
-		rtmpURL, ok := knownPlatforms[d.Platform]
-		if !ok {
-			continue
+		serverURL := strings.TrimRight(strings.TrimSpace(d.ServerURL), "/")
+		streamKey := strings.TrimSpace(d.StreamKey)
+		if serverURL == "" || streamKey == "" {
+			continue // skip incomplete entries
 		}
-		id, _ := generateKey()
+		id := d.ID
+		if id == "" {
+			id, _ = generateKey()
+		}
+		platform := d.Platform
+		if platform == "" {
+			platform = "custom"
+		}
+		label := d.Label
+		if label == "" {
+			label = platform
+		}
 		enabled := 0
-		if d.Enabled {
+		if d.Active {
 			enabled = 1
 		}
-		_, err := tx.Exec(`
-			INSERT INTO destinations (id, user_id, platform, rtmp_url, stream_key, enabled, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (user_id, platform) DO UPDATE SET
-				stream_key = EXCLUDED.stream_key,
-				enabled    = EXCLUDED.enabled,
-				updated_at = EXCLUDED.updated_at
-		`, id, userID, d.Platform, rtmpURL, strings.TrimSpace(d.StreamKey), enabled, time.Now().UTC().Format(time.RFC3339))
-		if err != nil {
-			log.Printf("[auth] save destinations error: %v", err)
+		// rtmp_url stores the server base URL; server_url is the same value
+		// (both columns kept for backward-compat with getDestinationsForKey).
+		if _, err := tx.Exec(`
+			INSERT INTO destinations (id, user_id, platform, label, rtmp_url, server_url, stream_key, enabled, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8)
+		`, id, userID, platform, label, serverURL, streamKey, enabled, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			log.Printf("[stream-creds] insert error: %v", err)
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
@@ -1914,7 +1945,9 @@ func getDestinationsForKey(streamKey string) []string {
 		if err := rows.Scan(&rtmpURL, &key); err != nil {
 			continue
 		}
-		dests = append(dests, rtmpURL+"/"+key)
+		// Ensure exactly one slash between server URL and stream key.
+		dest := strings.TrimRight(rtmpURL, "/") + "/" + strings.TrimLeft(key, "/")
+		dests = append(dests, dest)
 	}
 	return dests
 }
