@@ -310,6 +310,14 @@ func handleRTMPConn(conn net.Conn, sm *streamManager) {
 	}
 	log.Printf("[rtmp] New publisher → stream key: %q", key)
 
+	// Check if streaming is disabled for this user due to listener limit
+	userID := getUserIDFromStreamKey(key)
+	if userID != "" && isStreamingDisabled(userID) {
+		log.Printf("[rtmp/%s] Rejected: streaming disabled for user (listener limit exceeded)", key)
+		conn.Close()
+		return
+	}
+
 	// Look up multistream destinations for this key.
 	destinations := getDestinationsForKey(key)
 	if len(destinations) > 0 {
@@ -690,6 +698,61 @@ func totalLiveListenerCount(userID string) int {
 	return icecastListenerCountForUser(userID) + webListenerCountForUser(userID)
 }
 
+// Listener limits per plan
+func getListenerLimit(plan string) int {
+	switch plan {
+	case "starter":
+		return 500
+	case "professional":
+		return 1000
+	case "enterprise":
+		return 2000
+	case "ultimate":
+		return 999999 // effectively unlimited
+	default:
+		return 500 // default to starter
+	}
+}
+
+// Get user's plan from database
+func getUserPlan(userID string) string {
+	var plan string
+	err := db.QueryRow(`SELECT plan FROM stations WHERE user_id = $1`, userID).Scan(&plan)
+	if err != nil || plan == "" {
+		return "starter" // default
+	}
+	return plan
+}
+
+// Check if user is at or over their listener limit
+func isAtListenerLimit(userID string) bool {
+	plan := getUserPlan(userID)
+	limit := getListenerLimit(plan)
+	current := totalLiveListenerCount(userID)
+	return current >= limit
+}
+
+// Check if user exceeded limit by more than 5 (streaming disabled)
+func isStreamingDisabled(userID string) bool {
+	plan := getUserPlan(userID)
+	limit := getListenerLimit(plan)
+	current := totalLiveListenerCount(userID)
+	return current > limit+5
+}
+
+// Get user ID from stream key
+func getUserIDFromStreamKey(streamKey string) string {
+	if db == nil {
+		return ""
+	}
+	var userID string
+	err := db.QueryRow(`SELECT id FROM users WHERE stream_key = $1`, streamKey).Scan(&userID)
+	if err != nil {
+		return ""
+	}
+	return userID
+}
+
 func syncLiveListenerCount(userID string) {
 	if userID == "" {
 		return
@@ -699,6 +762,11 @@ func syncLiveListenerCount(userID string) {
 }
 
 func registerWebListener(userID, slug, ip string, ttl time.Duration) (string, error) {
+	// Check listener limit before allowing new connection
+	if isAtListenerLimit(userID) {
+		return "", errors.New("listener capacity reached")
+	}
+
 	sessionID, err := generateKey()
 	if err != nil {
 		return "", err
@@ -1693,6 +1761,98 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleListenerStatus returns the current listener count, limit, and status
+// GET /api/user/listener-status
+func handleListenerStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.Context().Value(contextKeyUserID).(string)
+	plan := getUserPlan(userID)
+	limit := getListenerLimit(plan)
+	current := totalLiveListenerCount(userID)
+	overLimit := current - limit
+
+	var status string
+	if current >= limit+6 {
+		status = "suspended" // 6+ over limit - streaming disabled
+	} else if current > limit {
+		status = "warning" // 1-5 over limit - warning only
+	} else if current >= int(float64(limit)*0.9) {
+		status = "approaching" // 90%+ of limit
+	} else {
+		status = "ok"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"current":    current,
+		"limit":      limit,
+		"plan":       plan,
+		"status":     status,
+		"over_limit": overLimit,
+		"percentage": int(float64(current) / float64(limit) * 100),
+	})
+}
+
+// handleUpgradePlan updates the user's subscription plan and billing cycle
+// POST /api/user/upgrade {"plan": "professional", "billing_cycle": "monthly"}
+func handleUpgradePlan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.Context().Value(contextKeyUserID).(string)
+
+	var body struct {
+		Plan         string `json:"plan"`
+		BillingCycle string `json:"billing_cycle"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate plan
+	validPlans := map[string]bool{
+		"starter":      true,
+		"professional": true,
+		"enterprise":   true,
+		"ultimate":     true,
+	}
+	if !validPlans[body.Plan] {
+		http.Error(w, "invalid plan", http.StatusBadRequest)
+		return
+	}
+
+	// Validate billing cycle
+	if body.BillingCycle != "monthly" && body.BillingCycle != "yearly" {
+		http.Error(w, "invalid billing cycle", http.StatusBadRequest)
+		return
+	}
+
+	// Update the plan in the database
+	_, err := db.Exec(`UPDATE stations SET plan = $1, billing_cycle = $2 WHERE user_id = $3`,
+		body.Plan, body.BillingCycle, userID)
+	if err != nil {
+		log.Printf("[upgrade] Error updating plan for user %s: %v", userID, err)
+		http.Error(w, "failed to update plan", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[upgrade] User %s upgraded to %s (%s)", userID, body.Plan, body.BillingCycle)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"plan":          body.Plan,
+		"billing_cycle": body.BillingCycle,
+	})
 }
 
 // handleChangePassword changes the authenticated user's password.
@@ -3350,6 +3510,12 @@ func handleRelayStart(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := r.Context().Value(contextKeyUserID).(string)
 
+	// Check if streaming is disabled due to exceeding listener limit
+	if isStreamingDisabled(userID) {
+		http.Error(w, "streaming disabled - listener limit exceeded", http.StatusForbidden)
+		return
+	}
+
 	var body struct {
 		Path string `json:"path"`
 	}
@@ -3807,6 +3973,8 @@ func main() {
 	mux.HandleFunc("/api/auth/", handleOAuthRoute) // platform OAuth connect + callback
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
 	mux.HandleFunc("/api/user/profile", requireAuth(handleUserProfile))
+	mux.HandleFunc("/api/user/listener-status", requireAuth(handleListenerStatus))
+	mux.HandleFunc("/api/user/upgrade", requireAuth(handleUpgradePlan))
 	mux.HandleFunc("/api/user/password", requireAuth(handleChangePassword))
 	mux.HandleFunc("/api/user/account", requireAuth(handleDeleteAccount))
 	mux.HandleFunc("/api/user/oauth-connections", requireAuth(handleOAuthConnections))
