@@ -563,6 +563,8 @@ func initDB(dsn string) error {
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS source_password TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS icecast_listen_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'starter'`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS billing_cycle TEXT NOT NULL DEFAULT 'monthly'`,
 	} {
 		if _, err = db.Exec(migration); err != nil {
 			return err
@@ -1590,19 +1592,21 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		var firstName, lastName string
 		_ = db.QueryRow(`SELECT first_name, last_name FROM users WHERE id = $1`, userID).Scan(&firstName, &lastName)
-		var stationName, genre, description, logoURL, stationSlug string
-		_ = db.QueryRow(`SELECT station_name, genre, description, logo_url, station_slug FROM stations WHERE user_id = $1`, userID).
-			Scan(&stationName, &genre, &description, &logoURL, &stationSlug)
+		var stationName, genre, description, logoURL, stationSlug, plan, billingCycle string
+		_ = db.QueryRow(`SELECT station_name, genre, description, logo_url, station_slug, plan, billing_cycle FROM stations WHERE user_id = $1`, userID).
+			Scan(&stationName, &genre, &description, &logoURL, &stationSlug, &plan, &billingCycle)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
-			"email":        email,
-			"first_name":   firstName,
-			"last_name":    lastName,
-			"station_name": stationName,
-			"genre":        genre,
-			"description":  description,
-			"logo_url":     logoURL,
-			"listen_url":   "/listen/" + stationSlug,
+			"email":         email,
+			"first_name":    firstName,
+			"last_name":     lastName,
+			"station_name":  stationName,
+			"genre":         genre,
+			"description":   description,
+			"logo_url":      logoURL,
+			"listen_url":    "/listen/" + stationSlug,
+			"plan":          plan,
+			"billing_cycle": billingCycle,
 		})
 
 	case http.MethodPut:
