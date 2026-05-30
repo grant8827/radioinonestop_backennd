@@ -1,4 +1,5 @@
-// Radio In One Stop — Media Server
+// Radio In One Stop — Media Server v2.1
+// Super Admin API with role-based access control
 //
 // Architecture:
 //   OBS/vMix  ──RTMP──►  rtmpServer (port 1935)
