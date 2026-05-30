@@ -4225,23 +4225,99 @@ func getAdCampaigns(w http.ResponseWriter, r *http.Request) {
 }
 
 func createAdCampaign(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		PlacementID     string  `json:"placementId"`
-		AdvertiserName  string  `json:"advertiserName"`
-		TargetURL       string  `json:"targetUrl"`
-		AssetType       string  `json:"assetType"`
-		AssetURL        string  `json:"assetUrl"`
-		AssetName       string  `json:"assetName"`
-		Price           float64 `json:"price"`
-		DiscountPercent int     `json:"discountPercent"`
+	contentType := r.Header.Get("Content-Type")
+	
+	// Handle both JSON and multipart form data
+	var placementID, advertiserName, targetURL, assetType, assetURL, assetName string
+	var price float64
+	var discountPercent int
+
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		// Parse multipart form
+		if err := r.ParseMultipartForm(32 << 20); err != nil { // 32 MB max
+			http.Error(w, "failed to parse form", http.StatusBadRequest)
+			return
+		}
+
+		placementID = r.FormValue("placementId")
+		advertiserName = r.FormValue("advertiserName")
+		targetURL = r.FormValue("targetUrl")
+		assetType = r.FormValue("assetType")
+		assetName = r.FormValue("assetName")
+		fmt.Sscanf(r.FormValue("price"), "%f", &price)
+		fmt.Sscanf(r.FormValue("discountPercent"), "%d", &discountPercent)
+
+		// Handle file upload
+		file, header, err := r.FormFile("assetFile")
+		if err == nil {
+			defer file.Close()
+
+			// Create uploads directory if it doesn't exist
+			uploadsDir := "./uploads/ads"
+			if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+				log.Printf("[ads] Error creating uploads dir: %v", err)
+				http.Error(w, "server error", http.StatusInternalServerError)
+				return
+			}
+
+			// Generate unique filename
+			ext := filepath.Ext(header.Filename)
+			fileID, _ := generateKey()
+			filename := fileID + ext
+			filePath := filepath.Join(uploadsDir, filename)
+
+			// Save file
+			dst, err := os.Create(filePath)
+			if err != nil {
+				log.Printf("[ads] Error creating file: %v", err)
+				http.Error(w, "failed to save file", http.StatusInternalServerError)
+				return
+			}
+			defer dst.Close()
+
+			if _, err := io.Copy(dst, file); err != nil {
+				log.Printf("[ads] Error saving file: %v", err)
+				http.Error(w, "failed to save file", http.StatusInternalServerError)
+				return
+			}
+
+			assetURL = "/uploads/ads/" + filename
+			if assetName == "" {
+				assetName = header.Filename
+			}
+		} else {
+			// No file uploaded, use URL if provided
+			assetURL = r.FormValue("assetUrl")
+		}
+	} else {
+		// JSON request
+		var body struct {
+			PlacementID     string  `json:"placementId"`
+			AdvertiserName  string  `json:"advertiserName"`
+			TargetURL       string  `json:"targetUrl"`
+			AssetType       string  `json:"assetType"`
+			AssetURL        string  `json:"assetUrl"`
+			AssetName       string  `json:"assetName"`
+			Price           float64 `json:"price"`
+			DiscountPercent int     `json:"discountPercent"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		placementID = body.PlacementID
+		advertiserName = body.AdvertiserName
+		targetURL = body.TargetURL
+		assetType = body.AssetType
+		assetURL = body.AssetURL
+		assetName = body.AssetName
+		price = body.Price
+		discountPercent = body.DiscountPercent
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if body.PlacementID == "" || body.AdvertiserName == "" || body.AssetType == "" {
+	if placementID == "" || advertiserName == "" || assetType == "" {
 		http.Error(w, "missing required fields", http.StatusBadRequest)
 		return
 	}
@@ -4252,9 +4328,9 @@ func createAdCampaign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	originalPrice := body.Price
-	if body.DiscountPercent > 0 {
-		originalPrice = body.Price / (1.0 - float64(body.DiscountPercent)/100.0)
+	originalPrice := price
+	if discountPercent > 0 {
+		originalPrice = price / (1.0 - float64(discountPercent)/100.0)
 	}
 
 	_, err = db.Exec(`
@@ -4263,9 +4339,9 @@ func createAdCampaign(w http.ResponseWriter, r *http.Request) {
 			asset_type, asset_url, asset_name,
 			price, original_price, discount_percent, status
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft')
-	`, campaignID, body.PlacementID, body.AdvertiserName, body.TargetURL,
-		body.AssetType, body.AssetURL, body.AssetName,
-		body.Price, originalPrice, body.DiscountPercent)
+	`, campaignID, placementID, advertiserName, targetURL,
+		assetType, assetURL, assetName,
+		price, originalPrice, discountPercent)
 
 	if err != nil {
 		log.Printf("[ads] Error creating campaign: %v", err)
@@ -4278,6 +4354,7 @@ func createAdCampaign(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":    true,
 		"campaignId": campaignID,
+		"assetUrl":   assetURL,
 	})
 }
 
@@ -4624,6 +4701,10 @@ func main() {
 
 	// HLS static file handler (serves /hls/<streamKey>/index.m3u8 etc.)
 	mux.HandleFunc("/hls/", hlsHandler)
+
+	// Uploads static file handler (serves /uploads/ads/<filename>)
+	uploadsFS := http.FileServer(http.Dir("./uploads"))
+	mux.Handle("/uploads/", http.StripPrefix("/uploads/", uploadsFS))
 
 	go hub.run()
 
