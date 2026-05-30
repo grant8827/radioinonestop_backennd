@@ -4162,7 +4162,11 @@ func handleAdCampaigns(w http.ResponseWriter, r *http.Request) {
 }
 
 func getAdCampaigns(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query(`
+	// Support filtering by placementId and status via query params
+	placementID := r.URL.Query().Get("placementId")
+	status := r.URL.Query().Get("status")
+
+	query := `
 		SELECT 
 			c.id, c.placement_id, c.advertiser_name, c.target_url,
 			c.asset_type, c.asset_url, c.asset_name,
@@ -4171,8 +4175,31 @@ func getAdCampaigns(w http.ResponseWriter, r *http.Request) {
 			p.name as placement_name, p.placement
 		FROM ad_campaigns c
 		JOIN ad_placements p ON c.placement_id = p.id
-		ORDER BY c.created_at DESC
-	`)
+	`
+
+	var conditions []string
+	var args []interface{}
+	argIdx := 1
+
+	if placementID != "" {
+		conditions = append(conditions, fmt.Sprintf("p.placement = $%d", argIdx))
+		args = append(args, placementID)
+		argIdx++
+	}
+
+	if status != "" {
+		conditions = append(conditions, fmt.Sprintf("c.status = $%d", argIdx))
+		args = append(args, status)
+		argIdx++
+	}
+
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	query += " ORDER BY c.created_at DESC"
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		log.Printf("[ads] Error fetching campaigns: %v", err)
 		http.Error(w, "server error", http.StatusInternalServerError)
