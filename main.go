@@ -645,6 +645,80 @@ func initDB(dsn string) error {
 		return err
 	}
 
+	// ── Advertising Platform Tables ───────────────────────────────────────
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS ad_placements (
+			id          TEXT PRIMARY KEY,
+			name        TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			placement   TEXT NOT NULL,
+			width       INT NOT NULL DEFAULT 0,
+			height      INT NOT NULL DEFAULT 0,
+			base_price  DECIMAL(10,2) NOT NULL DEFAULT 0,
+			active      BOOLEAN NOT NULL DEFAULT true,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS ad_campaigns (
+			id              TEXT PRIMARY KEY,
+			placement_id    TEXT NOT NULL,
+			advertiser_name TEXT NOT NULL,
+			target_url      TEXT NOT NULL DEFAULT '',
+			asset_type      TEXT NOT NULL,
+			asset_url       TEXT NOT NULL DEFAULT '',
+			asset_name      TEXT NOT NULL DEFAULT '',
+			price           DECIMAL(10,2) NOT NULL DEFAULT 0,
+			original_price  DECIMAL(10,2) NOT NULL DEFAULT 0,
+			discount_percent INT NOT NULL DEFAULT 0,
+			status          TEXT NOT NULL DEFAULT 'draft',
+			impressions     BIGINT NOT NULL DEFAULT 0,
+			clicks          BIGINT NOT NULL DEFAULT 0,
+			started_at      TIMESTAMPTZ,
+			ended_at        TIMESTAMPTZ,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			FOREIGN KEY (placement_id) REFERENCES ad_placements(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS ad_analytics (
+			id          BIGSERIAL PRIMARY KEY,
+			campaign_id TEXT NOT NULL,
+			event_type  TEXT NOT NULL,
+			ip_address  TEXT NOT NULL DEFAULT '',
+			user_agent  TEXT NOT NULL DEFAULT '',
+			country     TEXT NOT NULL DEFAULT '',
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			FOREIGN KEY (campaign_id) REFERENCES ad_campaigns(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_ad_analytics_campaign ON ad_analytics(campaign_id, created_at DESC)
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_ad_campaigns_placement ON ad_campaigns(placement_id, status)
+	`)
+	if err != nil {
+		return err
+	}
+
 	// ── Schema migrations (idempotent) ─────────────────────────────────────
 	// Add label column to destinations if not present (Stage 5).
 	_, _ = db.Exec(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS label TEXT NOT NULL DEFAULT ''`)
@@ -652,6 +726,30 @@ func initDB(dsn string) error {
 	_, _ = db.Exec(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS server_url TEXT NOT NULL DEFAULT ''`)
 	// Drop old UNIQUE(user_id, platform) to allow multiple destinations per platform.
 	_, _ = db.Exec(`ALTER TABLE destinations DROP CONSTRAINT IF EXISTS destinations_user_id_platform_key`)
+
+	// ── Seed Default Ad Placements ────────────────────────────────────────
+	defaultPlacements := []struct {
+		ID          string
+		Name        string
+		Description string
+		Placement   string
+		Width       int
+		Height      int
+		BasePrice   float64
+	}{
+		{"player-overlay", "Radio Player Video Overlay", "Video overlay displayed on the player during streaming", "player-overlay", 640, 360, 150.00},
+		{"header-banner", "Global Webpage Header Banner", "Horizontal banner displayed at the top of all pages", "header-banner", 728, 90, 110.00},
+		{"sidebar", "Listener Directory Sidebar", "Square banner in the sidebar of the listener pages", "sidebar", 300, 250, 100.00},
+		{"audio-pre", "Audio Stream Pre-roll", "Audio advertisement played before stream starts", "audio-pre", 0, 0, 80.00},
+	}
+
+	for _, p := range defaultPlacements {
+		_, _ = db.Exec(`
+			INSERT INTO ad_placements (id, name, description, placement, width, height, base_price)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO NOTHING
+		`, p.ID, p.Name, p.Description, p.Placement, p.Width, p.Height, p.BasePrice)
+	}
 
 	return nil
 }
@@ -4001,6 +4099,430 @@ func handleSyncOAuthStreamKeys(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(results)
 }
 
+// ─── Advertising Platform Handlers ────────────────────────────────────────────
+
+// handleAdPlacements - GET all available ad placements
+func handleAdPlacements(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT id, name, description, placement, width, height, base_price, active
+		FROM ad_placements
+		WHERE active = true
+		ORDER BY created_at
+	`)
+	if err != nil {
+		log.Printf("[ads] Error fetching placements: %v", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type Placement struct {
+		ID          string  `json:"id"`
+		Name        string  `json:"name"`
+		Description string  `json:"description"`
+		Placement   string  `json:"placement"`
+		Width       int     `json:"width"`
+		Height      int     `json:"height"`
+		BasePrice   float64 `json:"basePrice"`
+		Active      bool    `json:"active"`
+	}
+
+	var placements []Placement
+	for rows.Next() {
+		var p Placement
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Placement, &p.Width, &p.Height, &p.BasePrice, &p.Active); err != nil {
+			continue
+		}
+		placements = append(placements, p)
+	}
+
+	if placements == nil {
+		placements = []Placement{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(placements)
+}
+
+// handleAdCampaigns - GET all campaigns or POST to create new campaign
+func handleAdCampaigns(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		getAdCampaigns(w, r)
+	case http.MethodPost:
+		createAdCampaign(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getAdCampaigns(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT 
+			c.id, c.placement_id, c.advertiser_name, c.target_url,
+			c.asset_type, c.asset_url, c.asset_name,
+			c.price, c.original_price, c.discount_percent,
+			c.status, c.impressions, c.clicks, c.created_at,
+			p.name as placement_name, p.placement
+		FROM ad_campaigns c
+		JOIN ad_placements p ON c.placement_id = p.id
+		ORDER BY c.created_at DESC
+	`)
+	if err != nil {
+		log.Printf("[ads] Error fetching campaigns: %v", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type Campaign struct {
+		ID              string  `json:"id"`
+		PlacementID     string  `json:"placementId"`
+		PlacementName   string  `json:"placementName"`
+		Placement       string  `json:"placement"`
+		AdvertiserName  string  `json:"advertiserName"`
+		TargetURL       string  `json:"targetUrl"`
+		AssetType       string  `json:"assetType"`
+		AssetURL        string  `json:"assetUrl"`
+		AssetName       string  `json:"assetName"`
+		Price           float64 `json:"price"`
+		OriginalPrice   float64 `json:"originalPrice"`
+		DiscountPercent int     `json:"discountPercent"`
+		Status          string  `json:"status"`
+		Impressions     int64   `json:"impressions"`
+		Clicks          int64   `json:"clicks"`
+		CreatedAt       string  `json:"createdAt"`
+	}
+
+	var campaigns []Campaign
+	for rows.Next() {
+		var c Campaign
+		var createdAt time.Time
+		if err := rows.Scan(
+			&c.ID, &c.PlacementID, &c.AdvertiserName, &c.TargetURL,
+			&c.AssetType, &c.AssetURL, &c.AssetName,
+			&c.Price, &c.OriginalPrice, &c.DiscountPercent,
+			&c.Status, &c.Impressions, &c.Clicks, &createdAt,
+			&c.PlacementName, &c.Placement,
+		); err != nil {
+			continue
+		}
+		c.CreatedAt = createdAt.Format(time.RFC3339)
+		campaigns = append(campaigns, c)
+	}
+
+	if campaigns == nil {
+		campaigns = []Campaign{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(campaigns)
+}
+
+func createAdCampaign(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PlacementID     string  `json:"placementId"`
+		AdvertiserName  string  `json:"advertiserName"`
+		TargetURL       string  `json:"targetUrl"`
+		AssetType       string  `json:"assetType"`
+		AssetURL        string  `json:"assetUrl"`
+		AssetName       string  `json:"assetName"`
+		Price           float64 `json:"price"`
+		DiscountPercent int     `json:"discountPercent"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if body.PlacementID == "" || body.AdvertiserName == "" || body.AssetType == "" {
+		http.Error(w, "missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	campaignID, err := generateKey()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	originalPrice := body.Price
+	if body.DiscountPercent > 0 {
+		originalPrice = body.Price / (1.0 - float64(body.DiscountPercent)/100.0)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO ad_campaigns (
+			id, placement_id, advertiser_name, target_url,
+			asset_type, asset_url, asset_name,
+			price, original_price, discount_percent, status
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft')
+	`, campaignID, body.PlacementID, body.AdvertiserName, body.TargetURL,
+		body.AssetType, body.AssetURL, body.AssetName,
+		body.Price, originalPrice, body.DiscountPercent)
+
+	if err != nil {
+		log.Printf("[ads] Error creating campaign: %v", err)
+		http.Error(w, "failed to create campaign", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"campaignId": campaignID,
+	})
+}
+
+// handleAdCampaign - GET/PUT/DELETE individual campaign
+func handleAdCampaign(w http.ResponseWriter, r *http.Request) {
+	// Extract ID from /api/ads/campaigns/{id}
+	path := strings.TrimPrefix(r.URL.Path, "/api/ads/campaigns/")
+	campaignID := strings.Split(path, "/")[0]
+
+	if campaignID == "" {
+		http.Error(w, "campaign ID required", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		getAdCampaign(w, r, campaignID)
+	case http.MethodPut:
+		updateAdCampaign(w, r, campaignID)
+	case http.MethodDelete:
+		deleteAdCampaign(w, r, campaignID)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getAdCampaign(w http.ResponseWriter, r *http.Request, campaignID string) {
+	var c struct {
+		ID              string  `json:"id"`
+		PlacementID     string  `json:"placementId"`
+		AdvertiserName  string  `json:"advertiserName"`
+		TargetURL       string  `json:"targetUrl"`
+		AssetType       string  `json:"assetType"`
+		AssetURL        string  `json:"assetUrl"`
+		AssetName       string  `json:"assetName"`
+		Price           float64 `json:"price"`
+		OriginalPrice   float64 `json:"originalPrice"`
+		DiscountPercent int     `json:"discountPercent"`
+		Status          string  `json:"status"`
+		Impressions     int64   `json:"impressions"`
+		Clicks          int64   `json:"clicks"`
+	}
+
+	err := db.QueryRow(`
+		SELECT id, placement_id, advertiser_name, target_url,
+			asset_type, asset_url, asset_name,
+			price, original_price, discount_percent,
+			status, impressions, clicks
+		FROM ad_campaigns
+		WHERE id = $1
+	`, campaignID).Scan(
+		&c.ID, &c.PlacementID, &c.AdvertiserName, &c.TargetURL,
+		&c.AssetType, &c.AssetURL, &c.AssetName,
+		&c.Price, &c.OriginalPrice, &c.DiscountPercent,
+		&c.Status, &c.Impressions, &c.Clicks,
+	)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "campaign not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		log.Printf("[ads] Error fetching campaign %s: %v", campaignID, err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(c)
+}
+
+func updateAdCampaign(w http.ResponseWriter, r *http.Request, campaignID string) {
+	var body struct {
+		AdvertiserName  *string  `json:"advertiserName"`
+		TargetURL       *string  `json:"targetUrl"`
+		AssetURL        *string  `json:"assetUrl"`
+		Price           *float64 `json:"price"`
+		DiscountPercent *int     `json:"discountPercent"`
+		Status          *string  `json:"status"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Build dynamic UPDATE query
+	updates := []string{}
+	args := []interface{}{}
+	argPos := 1
+
+	if body.AdvertiserName != nil {
+		updates = append(updates, fmt.Sprintf("advertiser_name = $%d", argPos))
+		args = append(args, *body.AdvertiserName)
+		argPos++
+	}
+	if body.TargetURL != nil {
+		updates = append(updates, fmt.Sprintf("target_url = $%d", argPos))
+		args = append(args, *body.TargetURL)
+		argPos++
+	}
+	if body.AssetURL != nil {
+		updates = append(updates, fmt.Sprintf("asset_url = $%d", argPos))
+		args = append(args, *body.AssetURL)
+		argPos++
+	}
+	if body.Price != nil {
+		updates = append(updates, fmt.Sprintf("price = $%d", argPos))
+		args = append(args, *body.Price)
+		argPos++
+	}
+	if body.DiscountPercent != nil {
+		updates = append(updates, fmt.Sprintf("discount_percent = $%d", argPos))
+		args = append(args, *body.DiscountPercent)
+		argPos++
+	}
+	if body.Status != nil {
+		updates = append(updates, fmt.Sprintf("status = $%d", argPos))
+		args = append(args, *body.Status)
+		argPos++
+	}
+
+	if len(updates) == 0 {
+		http.Error(w, "no fields to update", http.StatusBadRequest)
+		return
+	}
+
+	updates = append(updates, fmt.Sprintf("updated_at = NOW()"))
+	args = append(args, campaignID)
+
+	query := fmt.Sprintf("UPDATE ad_campaigns SET %s WHERE id = $%d", strings.Join(updates, ", "), argPos)
+
+	_, err := db.Exec(query, args...)
+	if err != nil {
+		log.Printf("[ads] Error updating campaign %s: %v", campaignID, err)
+		http.Error(w, "failed to update campaign", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+func deleteAdCampaign(w http.ResponseWriter, r *http.Request, campaignID string) {
+	_, err := db.Exec(`DELETE FROM ad_campaigns WHERE id = $1`, campaignID)
+	if err != nil {
+		log.Printf("[ads] Error deleting campaign %s: %v", campaignID, err)
+		http.Error(w, "failed to delete campaign", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAdTrack - Track impressions and clicks (public endpoint, no auth)
+func handleAdTrack(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		CampaignID string `json:"campaignId"`
+		EventType  string `json:"eventType"` // "impression" or "click"
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if body.CampaignID == "" || (body.EventType != "impression" && body.EventType != "click") {
+		http.Error(w, "invalid parameters", http.StatusBadRequest)
+		return
+	}
+
+	// Extract client info
+	ip := r.RemoteAddr
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		ip = strings.Split(forwarded, ",")[0]
+	}
+	userAgent := r.Header.Get("User-Agent")
+	countryCode, _ := resolveCountry(ip)
+
+	// Update campaign counters
+	if body.EventType == "impression" {
+		_, _ = db.Exec(`UPDATE ad_campaigns SET impressions = impressions + 1 WHERE id = $1`, body.CampaignID)
+	} else {
+		_, _ = db.Exec(`UPDATE ad_campaigns SET clicks = clicks + 1 WHERE id = $1`, body.CampaignID)
+	}
+
+	// Log event in analytics table (async in production)
+	go func() {
+		_, _ = db.Exec(`
+			INSERT INTO ad_analytics (campaign_id, event_type, ip_address, user_agent, country)
+			VALUES ($1, $2, $3, $4, $5)
+		`, body.CampaignID, body.EventType, ip, userAgent, countryCode)
+	}()
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAdStats - Get aggregated stats for dashboard
+func handleAdStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var stats struct {
+		ActiveCampaigns int     `json:"activeCampaigns"`
+		TotalImpressions int64   `json:"totalImpressions"`
+		TotalClicks      int64   `json:"totalClicks"`
+		EstRevenue       float64 `json:"estRevenue"`
+		AvgCTR           float64 `json:"avgCTR"`
+	}
+
+	// Get active campaigns count
+	_ = db.QueryRow(`SELECT COUNT(*) FROM ad_campaigns WHERE status = 'active'`).Scan(&stats.ActiveCampaigns)
+
+	// Get total impressions and clicks
+	_ = db.QueryRow(`
+		SELECT COALESCE(SUM(impressions), 0), COALESCE(SUM(clicks), 0)
+		FROM ad_campaigns
+		WHERE status = 'active'
+	`).Scan(&stats.TotalImpressions, &stats.TotalClicks)
+
+	// Calculate estimated monthly revenue
+	_ = db.QueryRow(`
+		SELECT COALESCE(SUM(price), 0)
+		FROM ad_campaigns
+		WHERE status = 'active'
+	`).Scan(&stats.EstRevenue)
+
+	// Calculate average CTR
+	if stats.TotalImpressions > 0 {
+		stats.AvgCTR = float64(stats.TotalClicks) / float64(stats.TotalImpressions) * 100
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 func main() {
@@ -4092,6 +4614,13 @@ func main() {
 	mux.HandleFunc("/api/stations", handleGetStations)
 	mux.HandleFunc("/ws/encode", handleEncoderWS)
 	mux.HandleFunc("/listen/", handleListen)
+
+	// ── Advertising Platform API ──────────────────────────────────────────
+	mux.HandleFunc("/api/ads/placements", requireAuth(handleAdPlacements))
+	mux.HandleFunc("/api/ads/campaigns", requireAuth(handleAdCampaigns))
+	mux.HandleFunc("/api/ads/campaigns/", requireAuth(handleAdCampaign))
+	mux.HandleFunc("/api/ads/track", handleAdTrack)
+	mux.HandleFunc("/api/ads/stats", requireAuth(handleAdStats))
 
 	// HLS static file handler (serves /hls/<streamKey>/index.m3u8 etc.)
 	mux.HandleFunc("/hls/", hlsHandler)
