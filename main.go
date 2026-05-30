@@ -577,6 +577,7 @@ func initDB(dsn string) error {
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS icecast_listen_url TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'starter'`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS billing_cycle TEXT NOT NULL DEFAULT 'monthly'`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT false`,
 	} {
 		if _, err = db.Exec(migration); err != nil {
 			return err
@@ -595,6 +596,18 @@ func initDB(dsn string) error {
 	`)
 	if err != nil {
 		return err
+	}
+	for _, migration := range []string{
+		`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS monthly_price_cents INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS yearly_price_cents INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS listener_limit INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS channel_limit INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+	} {
+		if _, err = db.Exec(migration); err != nil {
+			return err
+		}
 	}
 	_, err = db.Exec(`
 		INSERT INTO package_plans (id, display_name, monthly_price_cents, yearly_price_cents, listener_limit, channel_limit)
@@ -4711,8 +4724,14 @@ func handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 func getAllUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
 		SELECT 
-			u.id, u.email, u.role, u.created_at,
-			s.station_name, s.plan, s.billing_cycle, s.is_suspended
+			u.id,
+			u.email,
+			COALESCE(u.role, 'user'),
+			COALESCE(u.created_at::text, ''),
+			COALESCE(s.station_name, ''),
+			COALESCE(s.plan, 'starter'),
+			COALESCE(s.billing_cycle, 'monthly'),
+			COALESCE(s.is_suspended, false)
 		FROM users u
 		LEFT JOIN stations s ON u.id = s.user_id
 		ORDER BY u.created_at DESC
@@ -4738,20 +4757,12 @@ func getAllUsers(w http.ResponseWriter, r *http.Request) {
 	var users []User
 	for rows.Next() {
 		var u User
-		var createdAt time.Time
-		var stationName, plan, billingCycle sql.NullString
-		var isSuspended sql.NullBool
 
-		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &createdAt,
-			&stationName, &plan, &billingCycle, &isSuspended); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &u.CreatedAt,
+			&u.StationName, &u.Plan, &u.BillingCycle, &u.IsSuspended); err != nil {
+			log.Printf("[admin] Error scanning user row: %v", err)
 			continue
 		}
-
-		u.CreatedAt = createdAt.Format(time.RFC3339)
-		u.StationName = stationName.String
-		u.Plan = plan.String
-		u.BillingCycle = billingCycle.String
-		u.IsSuspended = isSuspended.Bool
 
 		if u.Plan == "" {
 			u.Plan = "starter"
@@ -4761,6 +4772,11 @@ func getAllUsers(w http.ResponseWriter, r *http.Request) {
 		}
 
 		users = append(users, u)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[admin] Error reading user rows: %v", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
 	}
 
 	if users == nil {
@@ -4797,13 +4813,49 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	body.Plan = strings.ToLower(strings.TrimSpace(body.Plan))
+	body.BillingCycle = strings.ToLower(strings.TrimSpace(body.BillingCycle))
+	if body.Plan == "" {
+		body.Plan = "starter"
+	}
+	if body.BillingCycle == "" {
+		body.BillingCycle = "monthly"
+	}
+	if body.BillingCycle != "monthly" && body.BillingCycle != "yearly" {
+		http.Error(w, "invalid billing cycle", http.StatusBadRequest)
+		return
+	}
+	var planExists bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM package_plans WHERE id = $1)`, body.Plan).Scan(&planExists); err != nil {
+		log.Printf("[admin] Error validating plan %q: %v", body.Plan, err)
+		http.Error(w, "failed to validate plan", http.StatusInternalServerError)
+		return
+	}
+	if !planExists {
+		http.Error(w, "invalid plan", http.StatusBadRequest)
+		return
+	}
+	isSuspended := false
+	if body.IsSuspended != nil {
+		isSuspended = *body.IsSuspended
+	} else {
+		_ = db.QueryRow(`SELECT is_suspended FROM stations WHERE user_id = $1`, userID).Scan(&isSuspended)
+	}
+
+	var email string
+	_ = db.QueryRow(`SELECT email FROM users WHERE id = $1`, userID).Scan(&email)
+	if _, err := ensureStation(userID, email, "", ""); err != nil {
+		log.Printf("[admin] Error ensuring station for user %s: %v", userID, err)
+		http.Error(w, "failed to prepare station", http.StatusInternalServerError)
+		return
+	}
 
 	// Update station plan and suspension status
 	_, err := db.Exec(`
 		UPDATE stations 
 		SET plan = $1, billing_cycle = $2, is_suspended = $3
 		WHERE user_id = $4
-	`, body.Plan, body.BillingCycle, *body.IsSuspended, userID)
+	`, body.Plan, body.BillingCycle, isSuspended, userID)
 
 	if err != nil {
 		log.Printf("[admin] Error updating user: %v", err)
