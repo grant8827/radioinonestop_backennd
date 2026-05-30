@@ -578,6 +578,54 @@ func initDB(dsn string) error {
 			return err
 		}
 	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS package_plans (
+			id                 TEXT PRIMARY KEY,
+			display_name       TEXT NOT NULL,
+			monthly_price_cents INTEGER NOT NULL DEFAULT 0,
+			yearly_price_cents  INTEGER NOT NULL DEFAULT 0,
+			listener_limit      INTEGER NOT NULL DEFAULT 0,
+			channel_limit       INTEGER NOT NULL DEFAULT 0,
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
+		INSERT INTO package_plans (id, display_name, monthly_price_cents, yearly_price_cents, listener_limit, channel_limit)
+		VALUES
+			('starter', 'Starter', 2900, 29000, 500, 0),
+			('professional', 'Professional', 3900, 39000, 1000, 0),
+			('enterprise', 'Enterprise', 5900, 59000, 2000, 3),
+			('ultimate', 'Ultimate', 9900, 99000, 999999, 6)
+		ON CONFLICT (id) DO UPDATE SET
+			display_name = EXCLUDED.display_name,
+			monthly_price_cents = EXCLUDED.monthly_price_cents,
+			yearly_price_cents = EXCLUDED.yearly_price_cents,
+			listener_limit = EXCLUDED.listener_limit,
+			channel_limit = EXCLUDED.channel_limit
+	`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS package_upgrade_history (
+			id                TEXT PRIMARY KEY,
+			user_id           TEXT NOT NULL,
+			old_plan          TEXT NOT NULL DEFAULT '',
+			new_plan          TEXT NOT NULL,
+			old_billing_cycle TEXT NOT NULL DEFAULT '',
+			new_billing_cycle TEXT NOT NULL,
+			status            TEXT NOT NULL DEFAULT 'active',
+			payment_reference TEXT NOT NULL DEFAULT '',
+			created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return err
+	}
 	// OAuth platform connections table.
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS oauth_connections (
@@ -1808,6 +1856,7 @@ func handleUpgradePlan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := r.Context().Value(contextKeyUserID).(string)
+	email, _ := r.Context().Value(contextKeyEmail).(string)
 
 	var body struct {
 		Plan         string `json:"plan"`
@@ -1817,15 +1866,16 @@ func handleUpgradePlan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	body.Plan = strings.ToLower(strings.TrimSpace(body.Plan))
+	body.BillingCycle = strings.ToLower(strings.TrimSpace(body.BillingCycle))
 
-	// Validate plan
-	validPlans := map[string]bool{
-		"starter":      true,
-		"professional": true,
-		"enterprise":   true,
-		"ultimate":     true,
+	var planExists bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM package_plans WHERE id = $1)`, body.Plan).Scan(&planExists); err != nil {
+		log.Printf("[upgrade] Error validating plan %q for user %s: %v", body.Plan, userID, err)
+		http.Error(w, "failed to validate plan", http.StatusInternalServerError)
+		return
 	}
-	if !validPlans[body.Plan] {
+	if !planExists {
 		http.Error(w, "invalid plan", http.StatusBadRequest)
 		return
 	}
@@ -1836,20 +1886,72 @@ func handleUpgradePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update the plan in the database
-	_, err := db.Exec(`UPDATE stations SET plan = $1, billing_cycle = $2 WHERE user_id = $3`,
+	if _, err := ensureStation(userID, email, "", ""); err != nil {
+		log.Printf("[upgrade] Error ensuring station for user %s: %v", userID, err)
+		http.Error(w, "failed to prepare station", http.StatusInternalServerError)
+		return
+	}
+
+	upgradeID, err := generateKey()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var oldPlan, oldBillingCycle string
+	err = tx.QueryRow(`SELECT plan, billing_cycle FROM stations WHERE user_id = $1 FOR UPDATE`, userID).
+		Scan(&oldPlan, &oldBillingCycle)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "station not found", http.StatusInternalServerError)
+		return
+	}
+	if err != nil {
+		log.Printf("[upgrade] Error loading current plan for user %s: %v", userID, err)
+		http.Error(w, "failed to load current plan", http.StatusInternalServerError)
+		return
+	}
+
+	result, err := tx.Exec(`UPDATE stations SET plan = $1, billing_cycle = $2 WHERE user_id = $3`,
 		body.Plan, body.BillingCycle, userID)
 	if err != nil {
 		log.Printf("[upgrade] Error updating plan for user %s: %v", userID, err)
 		http.Error(w, "failed to update plan", http.StatusInternalServerError)
 		return
 	}
+	rowsAffected, err := result.RowsAffected()
+	if err == nil && rowsAffected == 0 {
+		http.Error(w, "no station updated", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO package_upgrade_history
+			(id, user_id, old_plan, new_plan, old_billing_cycle, new_billing_cycle, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'active')`,
+		upgradeID, userID, oldPlan, body.Plan, oldBillingCycle, body.BillingCycle,
+	); err != nil {
+		log.Printf("[upgrade] Error recording plan history for user %s: %v", userID, err)
+		http.Error(w, "failed to record upgrade", http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[upgrade] Error committing plan upgrade for user %s: %v", userID, err)
+		http.Error(w, "failed to update plan", http.StatusInternalServerError)
+		return
+	}
 
-	log.Printf("[upgrade] User %s upgraded to %s (%s)", userID, body.Plan, body.BillingCycle)
+	log.Printf("[upgrade] User %s changed plan from %s to %s (%s)", userID, oldPlan, body.Plan, body.BillingCycle)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":       true,
+		"upgrade_id":    upgradeID,
+		"old_plan":      oldPlan,
 		"plan":          body.Plan,
 		"billing_cycle": body.BillingCycle,
 	})
