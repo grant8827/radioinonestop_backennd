@@ -612,15 +612,17 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Add new columns for admin management (safe to run multiple times)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS monthly_price NUMERIC(10,2) NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS yearly_price NUMERIC(10,2) NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS features JSONB NOT NULL DEFAULT '[]'::jsonb`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS sale_percent INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS monthly_sale_percent INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS yearly_sale_percent INTEGER NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT false`)
-	
+
 	// Sync pricing data to new columns
 	_, _ = db.Exec(`
 		UPDATE package_plans 
@@ -629,7 +631,7 @@ func initDB(dsn string) error {
 		    yearly_price = yearly_price_cents / 100.0
 		WHERE monthly_price = 0 OR yearly_price = 0
 	`)
-	
+
 	// Create marketing content table
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS marketing_content (
@@ -645,7 +647,7 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS package_upgrade_history (
 			id                TEXT PRIMARY KEY,
@@ -4319,7 +4321,7 @@ func getAdCampaigns(w http.ResponseWriter, r *http.Request) {
 
 func createAdCampaign(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
-	
+
 	// Handle both JSON and multipart form data
 	var placementID, advertiserName, targetURL, assetType, assetURL, assetName string
 	var price float64
@@ -4660,7 +4662,7 @@ func handleAdStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var stats struct {
-		ActiveCampaigns int     `json:"activeCampaigns"`
+		ActiveCampaigns  int     `json:"activeCampaigns"`
 		TotalImpressions int64   `json:"totalImpressions"`
 		TotalClicks      int64   `json:"totalClicks"`
 		EstRevenue       float64 `json:"estRevenue"`
@@ -4738,25 +4740,25 @@ func getAllUsers(w http.ResponseWriter, r *http.Request) {
 		var createdAt time.Time
 		var stationName, plan, billingCycle sql.NullString
 		var isSuspended sql.NullBool
-		
+
 		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &createdAt,
 			&stationName, &plan, &billingCycle, &isSuspended); err != nil {
 			continue
 		}
-		
+
 		u.CreatedAt = createdAt.Format(time.RFC3339)
 		u.StationName = stationName.String
 		u.Plan = plan.String
 		u.BillingCycle = billingCycle.String
 		u.IsSuspended = isSuspended.Bool
-		
+
 		if u.Plan == "" {
 			u.Plan = "starter"
 		}
 		if u.BillingCycle == "" {
 			u.BillingCycle = "monthly"
 		}
-		
+
 		users = append(users, u)
 	}
 
@@ -4829,7 +4831,7 @@ func handleAdminPricing(w http.ResponseWriter, r *http.Request) {
 
 func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT id, name, monthly_price, yearly_price, features, sale_percent, is_featured
+		SELECT id, name, monthly_price, yearly_price, features, monthly_sale_percent, yearly_sale_percent, is_featured
 		FROM package_plans
 		ORDER BY monthly_price ASC
 	`)
@@ -4841,21 +4843,22 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type PackagePlan struct {
-		ID           string   `json:"id"`
-		Name         string   `json:"name"`
-		MonthlyPrice float64  `json:"monthlyPrice"`
-		YearlyPrice  float64  `json:"yearlyPrice"`
-		Features     []string `json:"features"`
-		SalePercent  int      `json:"salePercent"`
-		IsFeatured   bool     `json:"isFeatured"`
+		ID                 string   `json:"id"`
+		Name               string   `json:"name"`
+		MonthlyPrice       float64  `json:"monthlyPrice"`
+		YearlyPrice        float64  `json:"yearlyPrice"`
+		Features           []string `json:"features"`
+		MonthlySalePercent int      `json:"monthlySalePercent"`
+		YearlySalePercent  int      `json:"yearlySalePercent"`
+		IsFeatured         bool     `json:"isFeatured"`
 	}
 
 	var plans []PackagePlan
 	for rows.Next() {
 		var p PackagePlan
 		var featuresJSON []byte
-		if err := rows.Scan(&p.ID, &p.Name, &p.MonthlyPrice, &p.YearlyPrice, 
-			&featuresJSON, &p.SalePercent, &p.IsFeatured); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.MonthlyPrice, &p.YearlyPrice,
+			&featuresJSON, &p.MonthlySalePercent, &p.YearlySalePercent, &p.IsFeatured); err != nil {
 			continue
 		}
 		json.Unmarshal(featuresJSON, &p.Features)
@@ -4872,12 +4875,13 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 
 func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID           string   `json:"id"`
-		MonthlyPrice float64  `json:"monthlyPrice"`
-		YearlyPrice  float64  `json:"yearlyPrice"`
-		Features     []string `json:"features"`
-		SalePercent  int      `json:"salePercent"`
-		IsFeatured   bool     `json:"isFeatured"`
+		ID                 string   `json:"id"`
+		MonthlyPrice       float64  `json:"monthlyPrice"`
+		YearlyPrice        float64  `json:"yearlyPrice"`
+		Features           []string `json:"features"`
+		MonthlySalePercent int      `json:"monthlySalePercent"`
+		YearlySalePercent  int      `json:"yearlySalePercent"`
+		IsFeatured         bool     `json:"isFeatured"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -4890,10 +4894,10 @@ func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
 	_, err := db.Exec(`
 		UPDATE package_plans
 		SET monthly_price = $1, yearly_price = $2, features = $3, 
-		    sale_percent = $4, is_featured = $5
-		WHERE id = $6
-	`, body.MonthlyPrice, body.YearlyPrice, featuresJSON, 
-	   body.SalePercent, body.IsFeatured, body.ID)
+		    monthly_sale_percent = $4, yearly_sale_percent = $5, is_featured = $6
+		WHERE id = $7
+	`, body.MonthlyPrice, body.YearlyPrice, featuresJSON,
+		body.MonthlySalePercent, body.YearlySalePercent, body.IsFeatured, body.ID)
 
 	if err != nil {
 		log.Printf("[admin] Error updating pricing: %v", err)
