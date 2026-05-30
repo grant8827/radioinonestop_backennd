@@ -445,6 +445,7 @@ type Claims struct {
 	UserID      string `json:"user_id"`
 	Email       string `json:"email"`
 	StationName string `json:"station_name"`
+	Role        string `json:"role"`
 	jwt.RegisteredClaims
 }
 
@@ -478,6 +479,7 @@ func initDB(dsn string) error {
 			email         TEXT UNIQUE NOT NULL,
 			password_hash TEXT NOT NULL,
 			stream_key    TEXT UNIQUE NOT NULL,
+			role          TEXT NOT NULL DEFAULT 'user',
 			created_at    TEXT NOT NULL
 		)
 	`)
@@ -609,6 +611,40 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
+	
+	// Add new columns for admin management (safe to run multiple times)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS monthly_price NUMERIC(10,2) NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS yearly_price NUMERIC(10,2) NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS features JSONB NOT NULL DEFAULT '[]'::jsonb`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS sale_percent INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT false`)
+	
+	// Sync pricing data to new columns
+	_, _ = db.Exec(`
+		UPDATE package_plans 
+		SET name = id, 
+		    monthly_price = monthly_price_cents / 100.0, 
+		    yearly_price = yearly_price_cents / 100.0
+		WHERE monthly_price = 0 OR yearly_price = 0
+	`)
+	
+	// Create marketing content table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS marketing_content (
+			id          TEXT PRIMARY KEY,
+			page        TEXT NOT NULL,
+			section     TEXT NOT NULL,
+			content_type TEXT NOT NULL,
+			content     TEXT NOT NULL,
+			is_active   BOOLEAN NOT NULL DEFAULT true,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS package_upgrade_history (
 			id                TEXT PRIMARY KEY,
@@ -1593,11 +1629,12 @@ func ensureStation(userID, email, stationName, logoURL string) (string, error) {
 }
 
 // jwtSign creates a signed JWT for the given user (30-day expiry).
-func jwtSign(userID, email, stationName string) (string, error) {
+func jwtSign(userID, email, stationName, role string) (string, error) {
 	claims := Claims{
 		UserID:      userID,
 		Email:       email,
 		StationName: stationName,
+		Role:        role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(30 * 24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -1635,6 +1672,29 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		claims, err := jwtVerify(strings.TrimPrefix(auth, "Bearer "))
 		if err != nil {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), contextKeyUserID, claims.UserID)
+		ctx = context.WithValue(ctx, contextKeyEmail, claims.Email)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
+// requireAdmin middleware checks if the authenticated user has admin role
+func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		claims, err := jwtVerify(strings.TrimPrefix(auth, "Bearer "))
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if claims.Role != "admin" {
+			http.Error(w, "forbidden: admin access required", http.StatusForbidden)
 			return
 		}
 		ctx := context.WithValue(r.Context(), contextKeyUserID, claims.UserID)
@@ -1718,7 +1778,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	token, err := jwtSign(userID, body.Email, body.StationName)
+	token, err := jwtSign(userID, body.Email, body.StationName, "user")
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
@@ -1760,10 +1820,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
-	var userID, passwordHash, streamKey string
+	var userID, passwordHash, streamKey, role string
 	err := db.QueryRow(
-		`SELECT id, password_hash, stream_key FROM users WHERE email = $1`, body.Email,
-	).Scan(&userID, &passwordHash, &streamKey)
+		`SELECT id, password_hash, stream_key, role FROM users WHERE email = $1`, body.Email,
+	).Scan(&userID, &passwordHash, &streamKey, &role)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
@@ -1778,7 +1838,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	var stationName string
 	_ = db.QueryRow(`SELECT station_name FROM stations WHERE user_id = $1`, userID).Scan(&stationName)
-	token, err := jwtSign(userID, body.Email, stationName)
+	token, err := jwtSign(userID, body.Email, stationName, role)
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
@@ -1896,7 +1956,12 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Issue a fresh token so the frontend picks up any name/email change immediately
-		token, err := jwtSign(userID, email, newStationName)
+		var role string
+		_ = db.QueryRow(`SELECT role FROM users WHERE id = $1`, userID).Scan(&role)
+		if role == "" {
+			role = "user"
+		}
+		token, err := jwtSign(userID, email, newStationName, role)
 		if err != nil {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
@@ -4627,6 +4692,322 @@ func handleAdStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(stats)
 }
 
+// ── Super Admin API ───────────────────────────────────────────────────────────
+
+// handleAdminUsers - GET all users, PUT to update user
+func handleAdminUsers(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		getAllUsers(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getAllUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT 
+			u.id, u.email, u.role, u.created_at,
+			s.station_name, s.plan, s.billing_cycle, s.is_suspended
+		FROM users u
+		LEFT JOIN stations s ON u.id = s.user_id
+		ORDER BY u.created_at DESC
+	`)
+	if err != nil {
+		log.Printf("[admin] Error fetching users: %v", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type User struct {
+		ID           string `json:"id"`
+		Email        string `json:"email"`
+		Role         string `json:"role"`
+		CreatedAt    string `json:"createdAt"`
+		StationName  string `json:"stationName"`
+		Plan         string `json:"plan"`
+		BillingCycle string `json:"billingCycle"`
+		IsSuspended  bool   `json:"isSuspended"`
+	}
+
+	var users []User
+	for rows.Next() {
+		var u User
+		var createdAt time.Time
+		var stationName, plan, billingCycle sql.NullString
+		var isSuspended sql.NullBool
+		
+		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &createdAt,
+			&stationName, &plan, &billingCycle, &isSuspended); err != nil {
+			continue
+		}
+		
+		u.CreatedAt = createdAt.Format(time.RFC3339)
+		u.StationName = stationName.String
+		u.Plan = plan.String
+		u.BillingCycle = billingCycle.String
+		u.IsSuspended = isSuspended.Bool
+		
+		if u.Plan == "" {
+			u.Plan = "starter"
+		}
+		if u.BillingCycle == "" {
+			u.BillingCycle = "monthly"
+		}
+		
+		users = append(users, u)
+	}
+
+	if users == nil {
+		users = []User{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(users)
+}
+
+// handleAdminUserUpdate - PUT /api/admin/users/:id
+func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract user ID from path
+	path := strings.TrimPrefix(r.URL.Path, "/api/admin/users/")
+	userID := strings.Split(path, "/")[0]
+
+	if userID == "" {
+		http.Error(w, "user ID required", http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		Plan         string `json:"plan"`
+		BillingCycle string `json:"billingCycle"`
+		IsSuspended  *bool  `json:"isSuspended"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Update station plan and suspension status
+	_, err := db.Exec(`
+		UPDATE stations 
+		SET plan = $1, billing_cycle = $2, is_suspended = $3
+		WHERE user_id = $4
+	`, body.Plan, body.BillingCycle, *body.IsSuspended, userID)
+
+	if err != nil {
+		log.Printf("[admin] Error updating user: %v", err)
+		http.Error(w, "failed to update user", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "User updated successfully",
+	})
+}
+
+// handleAdminPricing - GET/PUT pricing configuration
+func handleAdminPricing(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		getAdminPricing(w, r)
+	case http.MethodPut:
+		updateAdminPricing(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getAdminPricing(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT id, name, monthly_price, yearly_price, features, sale_percent, is_featured
+		FROM package_plans
+		ORDER BY monthly_price ASC
+	`)
+	if err != nil {
+		log.Printf("[admin] Error fetching pricing: %v", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type PackagePlan struct {
+		ID           string   `json:"id"`
+		Name         string   `json:"name"`
+		MonthlyPrice float64  `json:"monthlyPrice"`
+		YearlyPrice  float64  `json:"yearlyPrice"`
+		Features     []string `json:"features"`
+		SalePercent  int      `json:"salePercent"`
+		IsFeatured   bool     `json:"isFeatured"`
+	}
+
+	var plans []PackagePlan
+	for rows.Next() {
+		var p PackagePlan
+		var featuresJSON []byte
+		if err := rows.Scan(&p.ID, &p.Name, &p.MonthlyPrice, &p.YearlyPrice, 
+			&featuresJSON, &p.SalePercent, &p.IsFeatured); err != nil {
+			continue
+		}
+		json.Unmarshal(featuresJSON, &p.Features)
+		plans = append(plans, p)
+	}
+
+	if plans == nil {
+		plans = []PackagePlan{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(plans)
+}
+
+func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID           string   `json:"id"`
+		MonthlyPrice float64  `json:"monthlyPrice"`
+		YearlyPrice  float64  `json:"yearlyPrice"`
+		Features     []string `json:"features"`
+		SalePercent  int      `json:"salePercent"`
+		IsFeatured   bool     `json:"isFeatured"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	featuresJSON, _ := json.Marshal(body.Features)
+
+	_, err := db.Exec(`
+		UPDATE package_plans
+		SET monthly_price = $1, yearly_price = $2, features = $3, 
+		    sale_percent = $4, is_featured = $5
+		WHERE id = $6
+	`, body.MonthlyPrice, body.YearlyPrice, featuresJSON, 
+	   body.SalePercent, body.IsFeatured, body.ID)
+
+	if err != nil {
+		log.Printf("[admin] Error updating pricing: %v", err)
+		http.Error(w, "failed to update pricing", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Pricing updated successfully",
+	})
+}
+
+// handleAdminMarketing - GET/PUT marketing content for public pages
+func handleAdminMarketing(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		getAdminMarketing(w, r)
+	case http.MethodPut:
+		updateAdminMarketing(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getAdminMarketing(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT id, page, section, content_type, content, is_active
+		FROM marketing_content
+		ORDER BY page, section
+	`)
+	if err != nil {
+		log.Printf("[admin] Error fetching marketing content: %v", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type MarketingContent struct {
+		ID          string `json:"id"`
+		Page        string `json:"page"`
+		Section     string `json:"section"`
+		ContentType string `json:"contentType"`
+		Content     string `json:"content"`
+		IsActive    bool   `json:"isActive"`
+	}
+
+	var content []MarketingContent
+	for rows.Next() {
+		var c MarketingContent
+		if err := rows.Scan(&c.ID, &c.Page, &c.Section, &c.ContentType, &c.Content, &c.IsActive); err != nil {
+			continue
+		}
+		content = append(content, c)
+	}
+
+	if content == nil {
+		content = []MarketingContent{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(content)
+}
+
+func updateAdminMarketing(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID          string `json:"id"`
+		Page        string `json:"page"`
+		Section     string `json:"section"`
+		ContentType string `json:"contentType"`
+		Content     string `json:"content"`
+		IsActive    bool   `json:"isActive"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if body.ID == "" {
+		// Insert new marketing content
+		newID, _ := generateKey()
+		_, err := db.Exec(`
+			INSERT INTO marketing_content (id, page, section, content_type, content, is_active)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, newID, body.Page, body.Section, body.ContentType, body.Content, body.IsActive)
+
+		if err != nil {
+			log.Printf("[admin] Error creating marketing content: %v", err)
+			http.Error(w, "failed to create marketing content", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// Update existing marketing content
+		_, err := db.Exec(`
+			UPDATE marketing_content
+			SET page = $1, section = $2, content_type = $3, content = $4, is_active = $5
+			WHERE id = $6
+		`, body.Page, body.Section, body.ContentType, body.Content, body.IsActive, body.ID)
+
+		if err != nil {
+			log.Printf("[admin] Error updating marketing content: %v", err)
+			http.Error(w, "failed to update marketing content", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Marketing content updated successfully",
+	})
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 func main() {
@@ -4719,12 +5100,18 @@ func main() {
 	mux.HandleFunc("/ws/encode", handleEncoderWS)
 	mux.HandleFunc("/listen/", handleListen)
 
-	// ── Advertising Platform API ──────────────────────────────────────────
-	mux.HandleFunc("/api/ads/placements", requireAuth(handleAdPlacements))
-	mux.HandleFunc("/api/ads/campaigns", requireAuth(handleAdCampaigns))
-	mux.HandleFunc("/api/ads/campaigns/", requireAuth(handleAdCampaign))
+	// ── Advertising Platform API (Admin Only) ────────────────────────────────
+	mux.HandleFunc("/api/ads/placements", requireAdmin(handleAdPlacements))
+	mux.HandleFunc("/api/ads/campaigns", requireAdmin(handleAdCampaigns))
+	mux.HandleFunc("/api/ads/campaigns/", requireAdmin(handleAdCampaign))
 	mux.HandleFunc("/api/ads/track", handleAdTrack)
-	mux.HandleFunc("/api/ads/stats", requireAuth(handleAdStats))
+	mux.HandleFunc("/api/ads/stats", requireAdmin(handleAdStats))
+
+	// ── Super Admin API ───────────────────────────────────────────────────────
+	mux.HandleFunc("/api/admin/users", requireAdmin(handleAdminUsers))
+	mux.HandleFunc("/api/admin/users/", requireAdmin(handleAdminUserUpdate))
+	mux.HandleFunc("/api/admin/pricing", requireAdmin(handleAdminPricing))
+	mux.HandleFunc("/api/admin/marketing", requireAdmin(handleAdminMarketing))
 
 	// HLS static file handler (serves /hls/<streamKey>/index.m3u8 etc.)
 	mux.HandleFunc("/hls/", hlsHandler)
