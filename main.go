@@ -21,6 +21,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -5316,6 +5317,240 @@ func handlePayPalSuccess(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ── PayPal Plan Sync (Admin) ──────────────────────────────────────────────────
+
+// paypalAPIRequest performs an authenticated JSON request to the PayPal REST API.
+func paypalAPIRequest(method, path string, payload interface{}) ([]byte, int, error) {
+	token, err := getPayPalAccessToken()
+	if err != nil {
+		return nil, 0, fmt.Errorf("auth: %w", err)
+	}
+	var bodyReader io.Reader
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, getPayPalBaseURL()+path, bodyReader)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Prefer", "return=representation")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	return respBody, resp.StatusCode, nil
+}
+
+// ensurePayPalProduct creates or returns a single product representing our subscriptions.
+func ensurePayPalProduct() (string, error) {
+	// Try to find by querying existing products (paginated). PayPal does not allow lookup by
+	// arbitrary name, so we cache the product ID in a simple settings table.
+	var productID string
+	_ = db.QueryRow(`SELECT value FROM app_settings WHERE key = 'paypal_product_id'`).Scan(&productID)
+	if strings.TrimSpace(productID) != "" {
+		return productID, nil
+	}
+
+	payload := map[string]interface{}{
+		"name":        "Radio In One Stop Subscription",
+		"description": "Radio In One Stop streaming subscription plans",
+		"type":        "SERVICE",
+		"category":    "SOFTWARE",
+	}
+	body, status, err := paypalAPIRequest(http.MethodPost, "/v1/catalogs/products", payload)
+	if err != nil {
+		return "", err
+	}
+	if status >= 300 {
+		return "", fmt.Errorf("create product failed (%d): %s", status, string(body))
+	}
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+	if result.ID == "" {
+		return "", fmt.Errorf("paypal returned no product id: %s", string(body))
+	}
+	_, _ = db.Exec(`
+		INSERT INTO app_settings (key, value) VALUES ('paypal_product_id', $1)
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+	`, result.ID)
+	return result.ID, nil
+}
+
+// createPayPalPlan creates a subscription plan in PayPal and returns the plan ID.
+func createPayPalPlan(productID, name, description string, priceUSD float64, intervalUnit string) (string, error) {
+	payload := map[string]interface{}{
+		"product_id":  productID,
+		"name":        name,
+		"description": description,
+		"status":      "ACTIVE",
+		"billing_cycles": []map[string]interface{}{
+			{
+				"frequency": map[string]interface{}{
+					"interval_unit":  intervalUnit, // "MONTH" or "YEAR"
+					"interval_count": 1,
+				},
+				"tenure_type":  "REGULAR",
+				"sequence":     1,
+				"total_cycles": 0, // 0 = infinite
+				"pricing_scheme": map[string]interface{}{
+					"fixed_price": map[string]interface{}{
+						"value":         fmt.Sprintf("%.2f", priceUSD),
+						"currency_code": "USD",
+					},
+				},
+			},
+		},
+		"payment_preferences": map[string]interface{}{
+			"auto_bill_outstanding":     true,
+			"setup_fee_failure_action":  "CONTINUE",
+			"payment_failure_threshold": 3,
+		},
+	}
+	body, status, err := paypalAPIRequest(http.MethodPost, "/v1/billing/plans", payload)
+	if err != nil {
+		return "", err
+	}
+	if status >= 300 {
+		return "", fmt.Errorf("create plan failed (%d): %s", status, string(body))
+	}
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+	if result.ID == "" {
+		return "", fmt.Errorf("paypal returned no plan id: %s", string(body))
+	}
+	return result.ID, nil
+}
+
+// handleAdminPayPalSyncPlans creates/updates PayPal subscription plans for every package_plan
+// row and saves the resulting plan IDs back to the database.
+func handleAdminPayPalSyncPlans(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(paypalClientID) == "" || strings.TrimSpace(paypalSecret) == "" {
+		http.Error(w, "PayPal credentials not configured", http.StatusBadRequest)
+		return
+	}
+
+	// Ensure settings table exists for caching product ID.
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`)
+
+	productID, err := ensurePayPalProduct()
+	if err != nil {
+		log.Printf("[paypal sync] product error: %v", err)
+		http.Error(w, "failed to create PayPal product: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT id, display_name, monthly_price, yearly_price,
+		       COALESCE(monthly_sale_percent, 0), COALESCE(yearly_sale_percent, 0),
+		       paypal_plan_id_monthly, paypal_plan_id_yearly
+		FROM package_plans
+		ORDER BY monthly_price ASC
+	`)
+	if err != nil {
+		http.Error(w, "failed to load plans: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type planResult struct {
+		ID            string `json:"id"`
+		Name          string `json:"name"`
+		MonthlyPlanID string `json:"monthly_plan_id"`
+		YearlyPlanID  string `json:"yearly_plan_id"`
+		Status        string `json:"status"`
+		Error         string `json:"error,omitempty"`
+	}
+	var results []planResult
+	overallErr := ""
+
+	for rows.Next() {
+		var (
+			id, name, existingMonthly, existingYearly string
+			monthlyPrice, yearlyPrice                 float64
+			monthlySale, yearlySale                   int
+		)
+		if err := rows.Scan(&id, &name, &monthlyPrice, &yearlyPrice, &monthlySale, &yearlySale, &existingMonthly, &existingYearly); err != nil {
+			overallErr = err.Error()
+			break
+		}
+
+		res := planResult{ID: id, Name: name, MonthlyPlanID: existingMonthly, YearlyPlanID: existingYearly, Status: "skipped"}
+
+		// Apply sale discounts to PayPal price (matches what the customer sees)
+		effectiveMonthly := monthlyPrice
+		if monthlySale > 0 && monthlySale < 100 {
+			effectiveMonthly = monthlyPrice * (1 - float64(monthlySale)/100.0)
+		}
+		effectiveYearly := yearlyPrice
+		if yearlySale > 0 && yearlySale < 100 {
+			effectiveYearly = yearlyPrice * (1 - float64(yearlySale)/100.0)
+		}
+
+		if existingMonthly == "" && effectiveMonthly > 0 {
+			planID, err := createPayPalPlan(productID, name+" (Monthly)", name+" plan billed monthly", effectiveMonthly, "MONTH")
+			if err != nil {
+				res.Status = "error"
+				res.Error = "monthly: " + err.Error()
+				log.Printf("[paypal sync] %s monthly: %v", id, err)
+			} else {
+				res.MonthlyPlanID = planID
+				res.Status = "created"
+				_, _ = db.Exec(`UPDATE package_plans SET paypal_plan_id_monthly = $1 WHERE id = $2`, planID, id)
+			}
+		}
+		if existingYearly == "" && effectiveYearly > 0 {
+			planID, err := createPayPalPlan(productID, name+" (Yearly)", name+" plan billed yearly", effectiveYearly, "YEAR")
+			if err != nil {
+				if res.Status != "error" {
+					res.Status = "error"
+				}
+				if res.Error != "" {
+					res.Error += "; "
+				}
+				res.Error += "yearly: " + err.Error()
+				log.Printf("[paypal sync] %s yearly: %v", id, err)
+			} else {
+				res.YearlyPlanID = planID
+				if res.Status != "error" {
+					res.Status = "created"
+				}
+				_, _ = db.Exec(`UPDATE package_plans SET paypal_plan_id_yearly = $1 WHERE id = $2`, planID, id)
+			}
+		}
+
+		results = append(results, res)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"product_id": productID,
+		"mode":       paypalMode,
+		"plans":      results,
+		"error":      overallErr,
+	})
+}
+
 // handleAdminMarketing - GET/PUT marketing content for public pages
 func handleAdminMarketing(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -5528,6 +5763,7 @@ func main() {
 	mux.HandleFunc("/api/admin/users", requireAdmin(handleAdminUsers))
 	mux.HandleFunc("/api/admin/users/", requireAdmin(handleAdminUserUpdate))
 	mux.HandleFunc("/api/admin/pricing", requireAdmin(handleAdminPricing))
+	mux.HandleFunc("/api/admin/paypal/sync-plans", requireAdmin(handleAdminPayPalSyncPlans))
 	mux.HandleFunc("/api/admin/marketing", requireAdmin(handleAdminMarketing))
 
 	// HLS static file handler (serves /hls/<streamKey>/index.m3u8 etc.)
