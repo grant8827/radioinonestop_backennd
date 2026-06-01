@@ -5069,40 +5069,39 @@ func getPayPalAccessToken() (string, error) {
 	return result.AccessToken, nil
 }
 
-// handlePayPalCreateSubscription creates a PayPal subscription
+// handlePayPalCreateSubscription returns the PayPal plan ID for a subscription
 func handlePayPalCreateSubscription(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var body struct {
-		PlanID       string `json:"planId"`
-		BillingCycle string `json:"billingCycle"`
-	}
+	// Get plan and billing from query parameters
+	planID := r.URL.Query().Get("plan")
+	billingCycle := r.URL.Query().Get("billing")
 	
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
+	if planID == "" || billingCycle == "" {
+		http.Error(w, "missing plan or billing parameter", http.StatusBadRequest)
 		return
 	}
 
 	// Get PayPal plan ID from database
 	var paypalPlanID string
 	column := "paypal_plan_id_monthly"
-	if body.BillingCycle == "yearly" {
+	if billingCycle == "yearly" {
 		column = "paypal_plan_id_yearly"
 	}
 	
-	err := db.QueryRow(`SELECT `+column+` FROM package_plans WHERE id = $1`, body.PlanID).Scan(&paypalPlanID)
+	err := db.QueryRow(`SELECT `+column+` FROM package_plans WHERE id = $1`, planID).Scan(&paypalPlanID)
 	if err != nil || paypalPlanID == "" {
-		log.Printf("[paypal] Plan ID not found for %s/%s", body.PlanID, body.BillingCycle)
+		log.Printf("[paypal] Plan ID not found for %s/%s", planID, billingCycle)
 		http.Error(w, "PayPal plan not configured", http.StatusBadRequest)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"paypalPlanId": paypalPlanID,
+		"plan_id": paypalPlanID,
 	})
 }
 
@@ -5432,7 +5431,7 @@ func main() {
 	mux.HandleFunc("/api/public/pricing", handlePublicPricing)
 
 	// ── PayPal Subscription API ───────────────────────────────────────────────
-	mux.HandleFunc("/api/paypal/create-subscription", handlePayPalCreateSubscription)
+	mux.HandleFunc("/api/paypal/create-subscription", requireAuth(handlePayPalCreateSubscription))
 	mux.HandleFunc("/api/paypal/webhook", handlePayPalWebhook)
 	mux.HandleFunc("/api/paypal/success", requireAuth(handlePayPalSuccess))
 
