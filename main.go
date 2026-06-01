@@ -4965,6 +4965,56 @@ func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handlePublicPricing - GET pricing for public pages (no auth required)
+func handlePublicPricing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT id, name, monthly_price, yearly_price, features, monthly_sale_percent, yearly_sale_percent, is_featured
+		FROM package_plans
+		ORDER BY monthly_price ASC
+	`)
+	if err != nil {
+		log.Printf("[public] Error fetching pricing: %v", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type PackagePlan struct {
+		ID                 string   `json:"id"`
+		Name               string   `json:"name"`
+		MonthlyPrice       float64  `json:"monthlyPrice"`
+		YearlyPrice        float64  `json:"yearlyPrice"`
+		Features           []string `json:"features"`
+		MonthlySalePercent int      `json:"monthlySalePercent"`
+		YearlySalePercent  int      `json:"yearlySalePercent"`
+		IsFeatured         bool     `json:"isFeatured"`
+	}
+
+	var plans []PackagePlan
+	for rows.Next() {
+		var p PackagePlan
+		var featuresJSON []byte
+		if err := rows.Scan(&p.ID, &p.Name, &p.MonthlyPrice, &p.YearlyPrice,
+			&featuresJSON, &p.MonthlySalePercent, &p.YearlySalePercent, &p.IsFeatured); err != nil {
+			continue
+		}
+		json.Unmarshal(featuresJSON, &p.Features)
+		plans = append(plans, p)
+	}
+
+	if plans == nil {
+		plans = []PackagePlan{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(plans)
+}
+
 // handleAdminMarketing - GET/PUT marketing content for public pages
 func handleAdminMarketing(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -5164,6 +5214,9 @@ func main() {
 	mux.HandleFunc("/api/ads/campaigns/", requireAdmin(handleAdCampaign))
 	mux.HandleFunc("/api/ads/track", handleAdTrack)
 	mux.HandleFunc("/api/ads/stats", requireAdmin(handleAdStats))
+
+	// ── Public API (no auth required) ────────────────────────────────────────
+	mux.HandleFunc("/api/public/pricing", handlePublicPricing)
 
 	// ── Super Admin API ───────────────────────────────────────────────────────
 	mux.HandleFunc("/api/admin/users", requireAdmin(handleAdminUsers))
