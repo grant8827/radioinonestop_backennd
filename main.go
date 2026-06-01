@@ -4900,16 +4900,16 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type PackagePlan struct {
-		ID                   string   `json:"id"`
-		Name                 string   `json:"name"`
-		MonthlyPrice         float64  `json:"monthlyPrice"`
-		YearlyPrice          float64  `json:"yearlyPrice"`
-		Features             []string `json:"features"`
-		MonthlySalePercent   int      `json:"monthlySalePercent"`
-		YearlySalePercent    int      `json:"yearlySalePercent"`
-		IsFeatured           bool     `json:"isFeatured"`
-		PayPalPlanIDMonthly  string   `json:"paypalPlanIdMonthly"`
-		PayPalPlanIDYearly   string   `json:"paypalPlanIdYearly"`
+		ID                  string   `json:"id"`
+		Name                string   `json:"name"`
+		MonthlyPrice        float64  `json:"monthlyPrice"`
+		YearlyPrice         float64  `json:"yearlyPrice"`
+		Features            []string `json:"features"`
+		MonthlySalePercent  int      `json:"monthlySalePercent"`
+		YearlySalePercent   int      `json:"yearlySalePercent"`
+		IsFeatured          bool     `json:"isFeatured"`
+		PayPalPlanIDMonthly string   `json:"paypalPlanIdMonthly"`
+		PayPalPlanIDYearly  string   `json:"paypalPlanIdYearly"`
 	}
 
 	var plans []PackagePlan
@@ -4935,15 +4935,15 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 
 func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID                   string   `json:"id"`
-		MonthlyPrice         float64  `json:"monthlyPrice"`
-		YearlyPrice          float64  `json:"yearlyPrice"`
-		Features             []string `json:"features"`
-		MonthlySalePercent   int      `json:"monthlySalePercent"`
-		YearlySalePercent    int      `json:"yearlySalePercent"`
-		IsFeatured           bool     `json:"isFeatured"`
-		PayPalPlanIDMonthly  string   `json:"paypalPlanIdMonthly"`
-		PayPalPlanIDYearly   string   `json:"paypalPlanIdYearly"`
+		ID                  string   `json:"id"`
+		MonthlyPrice        float64  `json:"monthlyPrice"`
+		YearlyPrice         float64  `json:"yearlyPrice"`
+		Features            []string `json:"features"`
+		MonthlySalePercent  int      `json:"monthlySalePercent"`
+		YearlySalePercent   int      `json:"yearlySalePercent"`
+		IsFeatured          bool     `json:"isFeatured"`
+		PayPalPlanIDMonthly string   `json:"paypalPlanIdMonthly"`
+		PayPalPlanIDYearly  string   `json:"paypalPlanIdYearly"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -5043,29 +5043,29 @@ func getPayPalBaseURL() string {
 
 func getPayPalAccessToken() (string, error) {
 	url := getPayPalBaseURL() + "/v1/oauth2/token"
-	
+
 	req, err := http.NewRequest("POST", url, strings.NewReader("grant_type=client_credentials"))
 	if err != nil {
 		return "", err
 	}
-	
+
 	req.SetBasicAuth(paypalClientID, paypalSecret)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	
+
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	
+
 	var result struct {
 		AccessToken string `json:"access_token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
-	
+
 	return result.AccessToken, nil
 }
 
@@ -5077,11 +5077,15 @@ func handlePayPalCreateSubscription(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get plan and billing from query parameters
-	planID := r.URL.Query().Get("plan")
-	billingCycle := r.URL.Query().Get("billing")
-	
+	planID := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("plan")))
+	billingCycle := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("billing")))
+
 	if planID == "" || billingCycle == "" {
 		http.Error(w, "missing plan or billing parameter", http.StatusBadRequest)
+		return
+	}
+	if billingCycle != "monthly" && billingCycle != "yearly" {
+		http.Error(w, "invalid billing cycle", http.StatusBadRequest)
 		return
 	}
 
@@ -5091,11 +5095,20 @@ func handlePayPalCreateSubscription(w http.ResponseWriter, r *http.Request) {
 	if billingCycle == "yearly" {
 		column = "paypal_plan_id_yearly"
 	}
-	
+
 	err := db.QueryRow(`SELECT `+column+` FROM package_plans WHERE id = $1`, planID).Scan(&paypalPlanID)
-	if err != nil || paypalPlanID == "" {
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "invalid plan", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		log.Printf("[paypal] Error loading PayPal plan ID for %s/%s: %v", planID, billingCycle, err)
+		http.Error(w, "failed to load PayPal plan", http.StatusInternalServerError)
+		return
+	}
+	if strings.TrimSpace(paypalPlanID) == "" {
 		log.Printf("[paypal] Plan ID not found for %s/%s", planID, billingCycle)
-		http.Error(w, "PayPal plan not configured", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("PayPal plan not configured for %s %s", planID, billingCycle), http.StatusBadRequest)
 		return
 	}
 
@@ -5121,9 +5134,9 @@ func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
 	var event struct {
 		EventType string `json:"event_type"`
 		Resource  struct {
-			ID           string `json:"id"`
-			Status       string `json:"status"`
-			Subscriber   struct {
+			ID         string `json:"id"`
+			Status     string `json:"status"`
+			Subscriber struct {
 				EmailAddress string `json:"email_address"`
 			} `json:"subscriber"`
 			PlanID string `json:"plan_id"`
@@ -5136,7 +5149,7 @@ func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[paypal webhook] Event: %s, Subscription: %s, Status: %s", 
+	log.Printf("[paypal webhook] Event: %s, Subscription: %s, Status: %s",
 		event.EventType, event.Resource.ID, event.Resource.Status)
 
 	subscriptionID := event.Resource.ID
@@ -5192,33 +5205,109 @@ func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
 
 // handlePayPalSuccess handles successful subscription creation
 func handlePayPalSuccess(w http.ResponseWriter, r *http.Request) {
-	subscriptionID := r.URL.Query().Get("subscription_id")
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		SubscriptionID string `json:"subscription_id"`
+		Plan           string `json:"plan"`
+		BillingCycle   string `json:"billing_cycle"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	subscriptionID := strings.TrimSpace(body.SubscriptionID)
+	if subscriptionID == "" {
+		subscriptionID = strings.TrimSpace(r.URL.Query().Get("subscription_id"))
+	}
 	if subscriptionID == "" {
 		http.Error(w, "missing subscription_id", http.StatusBadRequest)
 		return
 	}
-
-	// Get user from auth token
-	claims, ok := r.Context().Value("claims").(*Claims)
-	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	body.Plan = strings.ToLower(strings.TrimSpace(body.Plan))
+	body.BillingCycle = strings.ToLower(strings.TrimSpace(body.BillingCycle))
+	if body.Plan == "" {
+		body.Plan = "starter"
+	}
+	if body.BillingCycle == "" {
+		body.BillingCycle = "monthly"
+	}
+	if body.BillingCycle != "monthly" && body.BillingCycle != "yearly" {
+		http.Error(w, "invalid billing cycle", http.StatusBadRequest)
 		return
 	}
 
-	// Update station with PayPal subscription ID
-	_, err := db.Exec(`
+	userID := r.Context().Value(contextKeyUserID).(string)
+	email, _ := r.Context().Value(contextKeyEmail).(string)
+
+	var planExists bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM package_plans WHERE id = $1)`, body.Plan).Scan(&planExists); err != nil {
+		log.Printf("[paypal] Error validating plan %q for user %s: %v", body.Plan, userID, err)
+		http.Error(w, "failed to validate plan", http.StatusInternalServerError)
+		return
+	}
+	if !planExists {
+		http.Error(w, "invalid plan", http.StatusBadRequest)
+		return
+	}
+	if _, err := ensureStation(userID, email, "", ""); err != nil {
+		log.Printf("[paypal] Error ensuring station for user %s: %v", userID, err)
+		http.Error(w, "failed to prepare station", http.StatusInternalServerError)
+		return
+	}
+
+	upgradeID, err := generateKey()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var oldPlan, oldBillingCycle string
+	if err := tx.QueryRow(`SELECT plan, billing_cycle FROM stations WHERE user_id = $1 FOR UPDATE`, userID).
+		Scan(&oldPlan, &oldBillingCycle); err != nil {
+		log.Printf("[paypal] Error loading current plan for user %s: %v", userID, err)
+		http.Error(w, "failed to load current plan", http.StatusInternalServerError)
+		return
+	}
+
+	// Update station with PayPal subscription ID and active plan
+	_, err = tx.Exec(`
 		UPDATE stations 
-		SET paypal_subscription_id = $1, is_suspended = false
-		WHERE user_id = $2
-	`, subscriptionID, claims.UserID)
+		SET paypal_subscription_id = $1, is_suspended = false, plan = $2, billing_cycle = $3
+		WHERE user_id = $4
+	`, subscriptionID, body.Plan, body.BillingCycle, userID)
 
 	if err != nil {
 		log.Printf("[paypal] Error saving subscription: %v", err)
 		http.Error(w, "error saving subscription", http.StatusInternalServerError)
 		return
 	}
+	if _, err := tx.Exec(
+		`INSERT INTO package_upgrade_history
+			(id, user_id, old_plan, new_plan, old_billing_cycle, new_billing_cycle, status, payment_reference)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7)`,
+		upgradeID, userID, oldPlan, body.Plan, oldBillingCycle, body.BillingCycle, subscriptionID,
+	); err != nil {
+		log.Printf("[paypal] Error recording subscription history for user %s: %v", userID, err)
+		http.Error(w, "failed to record subscription", http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[paypal] Error committing subscription for user %s: %v", userID, err)
+		http.Error(w, "error saving subscription", http.StatusInternalServerError)
+		return
+	}
 
-	log.Printf("[paypal] Subscription %s linked to user %s", subscriptionID, claims.UserID)
+	log.Printf("[paypal] Subscription %s linked to user %s", subscriptionID, userID)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
