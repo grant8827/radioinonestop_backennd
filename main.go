@@ -578,6 +578,7 @@ func initDB(dsn string) error {
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'starter'`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS billing_cycle TEXT NOT NULL DEFAULT 'monthly'`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS paypal_subscription_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err = db.Exec(migration); err != nil {
 			return err
@@ -636,6 +637,8 @@ func initDB(dsn string) error {
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS monthly_sale_percent INTEGER NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS yearly_sale_percent INTEGER NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT false`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS paypal_plan_id_monthly TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS paypal_plan_id_yearly TEXT NOT NULL DEFAULT ''`)
 
 	// Sync pricing data to new columns
 	_, _ = db.Exec(`
@@ -4884,7 +4887,8 @@ func handleAdminPricing(w http.ResponseWriter, r *http.Request) {
 
 func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT id, name, monthly_price, yearly_price, features, monthly_sale_percent, yearly_sale_percent, is_featured
+		SELECT id, name, monthly_price, yearly_price, features, monthly_sale_percent, yearly_sale_percent, is_featured, 
+		       paypal_plan_id_monthly, paypal_plan_id_yearly
 		FROM package_plans
 		ORDER BY monthly_price ASC
 	`)
@@ -4896,14 +4900,16 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type PackagePlan struct {
-		ID                 string   `json:"id"`
-		Name               string   `json:"name"`
-		MonthlyPrice       float64  `json:"monthlyPrice"`
-		YearlyPrice        float64  `json:"yearlyPrice"`
-		Features           []string `json:"features"`
-		MonthlySalePercent int      `json:"monthlySalePercent"`
-		YearlySalePercent  int      `json:"yearlySalePercent"`
-		IsFeatured         bool     `json:"isFeatured"`
+		ID                   string   `json:"id"`
+		Name                 string   `json:"name"`
+		MonthlyPrice         float64  `json:"monthlyPrice"`
+		YearlyPrice          float64  `json:"yearlyPrice"`
+		Features             []string `json:"features"`
+		MonthlySalePercent   int      `json:"monthlySalePercent"`
+		YearlySalePercent    int      `json:"yearlySalePercent"`
+		IsFeatured           bool     `json:"isFeatured"`
+		PayPalPlanIDMonthly  string   `json:"paypalPlanIdMonthly"`
+		PayPalPlanIDYearly   string   `json:"paypalPlanIdYearly"`
 	}
 
 	var plans []PackagePlan
@@ -4911,7 +4917,8 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 		var p PackagePlan
 		var featuresJSON []byte
 		if err := rows.Scan(&p.ID, &p.Name, &p.MonthlyPrice, &p.YearlyPrice,
-			&featuresJSON, &p.MonthlySalePercent, &p.YearlySalePercent, &p.IsFeatured); err != nil {
+			&featuresJSON, &p.MonthlySalePercent, &p.YearlySalePercent, &p.IsFeatured,
+			&p.PayPalPlanIDMonthly, &p.PayPalPlanIDYearly); err != nil {
 			continue
 		}
 		json.Unmarshal(featuresJSON, &p.Features)
@@ -4928,13 +4935,15 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 
 func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID                 string   `json:"id"`
-		MonthlyPrice       float64  `json:"monthlyPrice"`
-		YearlyPrice        float64  `json:"yearlyPrice"`
-		Features           []string `json:"features"`
-		MonthlySalePercent int      `json:"monthlySalePercent"`
-		YearlySalePercent  int      `json:"yearlySalePercent"`
-		IsFeatured         bool     `json:"isFeatured"`
+		ID                   string   `json:"id"`
+		MonthlyPrice         float64  `json:"monthlyPrice"`
+		YearlyPrice          float64  `json:"yearlyPrice"`
+		Features             []string `json:"features"`
+		MonthlySalePercent   int      `json:"monthlySalePercent"`
+		YearlySalePercent    int      `json:"yearlySalePercent"`
+		IsFeatured           bool     `json:"isFeatured"`
+		PayPalPlanIDMonthly  string   `json:"paypalPlanIdMonthly"`
+		PayPalPlanIDYearly   string   `json:"paypalPlanIdYearly"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -4947,10 +4956,12 @@ func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
 	_, err := db.Exec(`
 		UPDATE package_plans
 		SET monthly_price = $1, yearly_price = $2, features = $3, 
-		    monthly_sale_percent = $4, yearly_sale_percent = $5, is_featured = $6
-		WHERE id = $7
+		    monthly_sale_percent = $4, yearly_sale_percent = $5, is_featured = $6,
+		    paypal_plan_id_monthly = $7, paypal_plan_id_yearly = $8
+		WHERE id = $9
 	`, body.MonthlyPrice, body.YearlyPrice, featuresJSON,
-		body.MonthlySalePercent, body.YearlySalePercent, body.IsFeatured, body.ID)
+		body.MonthlySalePercent, body.YearlySalePercent, body.IsFeatured,
+		body.PayPalPlanIDMonthly, body.PayPalPlanIDYearly, body.ID)
 
 	if err != nil {
 		log.Printf("[admin] Error updating pricing: %v", err)
@@ -5013,6 +5024,208 @@ func handlePublicPricing(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(plans)
+}
+
+// ── PayPal Subscription Integration ──────────────────────────────────────────
+
+var (
+	paypalClientID = os.Getenv("PAYPAL_CLIENT_ID")
+	paypalSecret   = os.Getenv("PAYPAL_SECRET")
+	paypalMode     = os.Getenv("PAYPAL_MODE") // "sandbox" or "live"
+)
+
+func getPayPalBaseURL() string {
+	if paypalMode == "live" {
+		return "https://api-m.paypal.com"
+	}
+	return "https://api-m.sandbox.paypal.com"
+}
+
+func getPayPalAccessToken() (string, error) {
+	url := getPayPalBaseURL() + "/v1/oauth2/token"
+	
+	req, err := http.NewRequest("POST", url, strings.NewReader("grant_type=client_credentials"))
+	if err != nil {
+		return "", err
+	}
+	
+	req.SetBasicAuth(paypalClientID, paypalSecret)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	
+	var result struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	
+	return result.AccessToken, nil
+}
+
+// handlePayPalCreateSubscription creates a PayPal subscription
+func handlePayPalCreateSubscription(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		PlanID       string `json:"planId"`
+		BillingCycle string `json:"billingCycle"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Get PayPal plan ID from database
+	var paypalPlanID string
+	column := "paypal_plan_id_monthly"
+	if body.BillingCycle == "yearly" {
+		column = "paypal_plan_id_yearly"
+	}
+	
+	err := db.QueryRow(`SELECT `+column+` FROM package_plans WHERE id = $1`, body.PlanID).Scan(&paypalPlanID)
+	if err != nil || paypalPlanID == "" {
+		log.Printf("[paypal] Plan ID not found for %s/%s", body.PlanID, body.BillingCycle)
+		http.Error(w, "PayPal plan not configured", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"paypalPlanId": paypalPlanID,
+	})
+}
+
+// handlePayPalWebhook processes PayPal webhook events
+func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "error reading body", http.StatusBadRequest)
+		return
+	}
+
+	var event struct {
+		EventType string `json:"event_type"`
+		Resource  struct {
+			ID           string `json:"id"`
+			Status       string `json:"status"`
+			Subscriber   struct {
+				EmailAddress string `json:"email_address"`
+			} `json:"subscriber"`
+			PlanID string `json:"plan_id"`
+		} `json:"resource"`
+	}
+
+	if err := json.Unmarshal(body, &event); err != nil {
+		log.Printf("[paypal webhook] Error parsing: %v", err)
+		http.Error(w, "error parsing webhook", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[paypal webhook] Event: %s, Subscription: %s, Status: %s", 
+		event.EventType, event.Resource.ID, event.Resource.Status)
+
+	subscriptionID := event.Resource.ID
+	email := event.Resource.Subscriber.EmailAddress
+
+	switch event.EventType {
+	case "BILLING.SUBSCRIPTION.CREATED", "BILLING.SUBSCRIPTION.ACTIVATED":
+		// Activate subscription
+		_, err := db.Exec(`
+			UPDATE stations 
+			SET paypal_subscription_id = $1, is_suspended = false
+			WHERE user_id = (SELECT id FROM users WHERE email = $2)
+		`, subscriptionID, email)
+		if err != nil {
+			log.Printf("[paypal webhook] Failed to activate: %v", err)
+		} else {
+			log.Printf("[paypal webhook] Activated subscription for %s", email)
+		}
+
+	case "BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED":
+		// Suspend subscription
+		_, err := db.Exec(`
+			UPDATE stations 
+			SET is_suspended = true
+			WHERE paypal_subscription_id = $1
+		`, subscriptionID)
+		if err != nil {
+			log.Printf("[paypal webhook] Failed to suspend: %v", err)
+		} else {
+			log.Printf("[paypal webhook] Suspended subscription %s", subscriptionID)
+		}
+
+	case "PAYMENT.SALE.COMPLETED":
+		// Payment successful - ensure station is active
+		_, err := db.Exec(`
+			UPDATE stations 
+			SET is_suspended = false
+			WHERE paypal_subscription_id = $1
+		`, subscriptionID)
+		if err != nil {
+			log.Printf("[paypal webhook] Failed to reactivate: %v", err)
+		}
+
+	case "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
+		// Payment failed - suspend after grace period
+		log.Printf("[paypal webhook] Payment failed for subscription %s", subscriptionID)
+		// You might want to send email notification here
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+// handlePayPalSuccess handles successful subscription creation
+func handlePayPalSuccess(w http.ResponseWriter, r *http.Request) {
+	subscriptionID := r.URL.Query().Get("subscription_id")
+	if subscriptionID == "" {
+		http.Error(w, "missing subscription_id", http.StatusBadRequest)
+		return
+	}
+
+	// Get user from auth token
+	claims, ok := r.Context().Value("claims").(*Claims)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Update station with PayPal subscription ID
+	_, err := db.Exec(`
+		UPDATE stations 
+		SET paypal_subscription_id = $1, is_suspended = false
+		WHERE user_id = $2
+	`, subscriptionID, claims.UserID)
+
+	if err != nil {
+		log.Printf("[paypal] Error saving subscription: %v", err)
+		http.Error(w, "error saving subscription", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[paypal] Subscription %s linked to user %s", subscriptionID, claims.UserID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Subscription activated",
+	})
 }
 
 // handleAdminMarketing - GET/PUT marketing content for public pages
@@ -5217,6 +5430,11 @@ func main() {
 
 	// ── Public API (no auth required) ────────────────────────────────────────
 	mux.HandleFunc("/api/public/pricing", handlePublicPricing)
+
+	// ── PayPal Subscription API ───────────────────────────────────────────────
+	mux.HandleFunc("/api/paypal/create-subscription", handlePayPalCreateSubscription)
+	mux.HandleFunc("/api/paypal/webhook", handlePayPalWebhook)
+	mux.HandleFunc("/api/paypal/success", requireAuth(handlePayPalSuccess))
 
 	// ── Super Admin API ───────────────────────────────────────────────────────
 	mux.HandleFunc("/api/admin/users", requireAdmin(handleAdminUsers))
