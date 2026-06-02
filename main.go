@@ -649,6 +649,50 @@ func initDB(dsn string) error {
 		    yearly_price = yearly_price_cents / 100.0
 		WHERE monthly_price = 0 OR yearly_price = 0
 	`)
+	_, err = db.Exec(`
+		WITH defaults(id, display_name, features) AS (
+			VALUES
+				('starter', 'Starter', jsonb_build_array(
+					'Radio DJ & Mixer',
+					'Custom stream URL',
+					'Embeddable player widget',
+					'Listeners analytics',
+					'Up to 500 concurrent listeners',
+					'Record sessions'
+				)),
+				('professional', 'Professional', jsonb_build_array(
+					'Everything in Starter',
+					'Conference call rooms',
+					'Screen sharing',
+					'Up to 10 participants per call',
+					'Up to 1000 concurrent listeners'
+				)),
+				('enterprise', 'Enterprise', jsonb_build_array(
+					'Everything in Professional',
+					'Video live streaming',
+					'Multistream up to 3 channels',
+					'Social media live streaming',
+					'Up to 2000 concurrent listeners'
+				)),
+				('ultimate', 'Ultimate', jsonb_build_array(
+					'Everything in Enterprise',
+					'Multistream up to 6 channels',
+					'Advanced analytics dashboard',
+					'Custom branding options',
+					'Unlimited concurrent listeners'
+				))
+		)
+		UPDATE package_plans p
+		SET
+			name = CASE WHEN p.name = '' OR p.name = p.id THEN d.display_name ELSE p.name END,
+			display_name = CASE WHEN p.display_name = '' OR p.display_name = p.id THEN d.display_name ELSE p.display_name END,
+			features = CASE WHEN p.features = '[]'::jsonb THEN d.features ELSE p.features END
+		FROM defaults d
+		WHERE p.id = d.id
+	`)
+	if err != nil {
+		return err
+	}
 
 	// Create marketing content table
 	_, err = db.Exec(`
