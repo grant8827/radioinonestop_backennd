@@ -23,6 +23,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -40,6 +41,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -580,6 +582,7 @@ func initDB(dsn string) error {
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS billing_cycle TEXT NOT NULL DEFAULT 'monthly'`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS paypal_subscription_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err = db.Exec(migration); err != nil {
 			return err
@@ -5077,6 +5080,8 @@ var (
 	paypalClientID = os.Getenv("PAYPAL_CLIENT_ID")
 	paypalSecret   = os.Getenv("PAYPAL_SECRET")
 	paypalMode     = os.Getenv("PAYPAL_MODE") // "sandbox" or "live"
+	stripeSecretKey    = os.Getenv("STRIPE_SECRET_KEY")
+	stripeWebhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
 )
 
 func getPayPalBaseURL() string {
@@ -5359,6 +5364,472 @@ func handlePayPalSuccess(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"message": "Subscription activated",
 	})
+}
+
+// ── Stripe Subscription Integration ──────────────────────────────────────────
+
+func stripeAPIRequest(method, path string, form url.Values) ([]byte, int, error) {
+	if strings.TrimSpace(stripeSecretKey) == "" {
+		return nil, 0, fmt.Errorf("stripe credentials not configured")
+	}
+
+	var bodyReader io.Reader
+	if form != nil {
+		bodyReader = strings.NewReader(form.Encode())
+	}
+
+	req, err := http.NewRequest(method, "https://api.stripe.com"+path, bodyReader)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.SetBasicAuth(stripeSecretKey, "")
+	if form != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	return respBody, resp.StatusCode, nil
+}
+
+func verifyStripeWebhookSignature(signatureHeader string, body []byte) bool {
+	if strings.TrimSpace(stripeWebhookSecret) == "" || strings.TrimSpace(signatureHeader) == "" {
+		return false
+	}
+
+	parts := strings.Split(signatureHeader, ",")
+	timestamp := ""
+	v1Sigs := make([]string, 0)
+	for _, part := range parts {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		if kv[0] == "t" {
+			timestamp = kv[1]
+		}
+		if kv[0] == "v1" {
+			v1Sigs = append(v1Sigs, kv[1])
+		}
+	}
+	if timestamp == "" || len(v1Sigs) == 0 {
+		return false
+	}
+
+	tsInt, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	now := time.Now().Unix()
+	if tsInt < now-300 || tsInt > now+300 {
+		return false
+	}
+
+	signedPayload := timestamp + "." + string(body)
+	mac := hmac.New(sha256.New, []byte(stripeWebhookSecret))
+	mac.Write([]byte(signedPayload))
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	for _, sig := range v1Sigs {
+		if hmac.Equal([]byte(expected), []byte(sig)) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractStringValue(raw json.RawMessage, key string) string {
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	v, _ := m[key].(string)
+	return strings.TrimSpace(v)
+}
+
+func handleStripeCreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(stripeSecretKey) == "" {
+		http.Error(w, "Stripe credentials not configured", http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		Plan         string `json:"plan"`
+		BillingCycle string `json:"billing_cycle"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Plan = strings.ToLower(strings.TrimSpace(body.Plan))
+	body.BillingCycle = strings.ToLower(strings.TrimSpace(body.BillingCycle))
+	if body.Plan == "" {
+		body.Plan = "starter"
+	}
+	if body.BillingCycle == "" {
+		body.BillingCycle = "monthly"
+	}
+	if body.BillingCycle != "monthly" && body.BillingCycle != "yearly" {
+		http.Error(w, "invalid billing cycle", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		displayName       string
+		monthlyPrice      float64
+		yearlyPrice       float64
+		monthlySale       int
+		yearlySale        int
+	)
+	err := db.QueryRow(`
+		SELECT display_name, monthly_price, yearly_price,
+		       COALESCE(monthly_sale_percent, 0), COALESCE(yearly_sale_percent, 0)
+		FROM package_plans
+		WHERE id = $1
+	`, body.Plan).Scan(&displayName, &monthlyPrice, &yearlyPrice, &monthlySale, &yearlySale)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "invalid plan", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		log.Printf("[stripe] plan query error for %s: %v", body.Plan, err)
+		http.Error(w, "failed to load plan", http.StatusInternalServerError)
+		return
+	}
+
+	effectivePrice := monthlyPrice
+	interval := "month"
+	if body.BillingCycle == "yearly" {
+		effectivePrice = yearlyPrice
+		interval = "year"
+		if yearlySale > 0 && yearlySale < 100 {
+			effectivePrice = yearlyPrice * (1 - float64(yearlySale)/100.0)
+		}
+	} else if monthlySale > 0 && monthlySale < 100 {
+		effectivePrice = monthlyPrice * (1 - float64(monthlySale)/100.0)
+	}
+	unitAmount := int64(effectivePrice * 100)
+	if unitAmount <= 0 {
+		http.Error(w, "invalid plan price", http.StatusBadRequest)
+		return
+	}
+
+	userID, _ := r.Context().Value(contextKeyUserID).(string)
+	email, _ := r.Context().Value(contextKeyEmail).(string)
+
+	frontendBase := strings.TrimSpace(r.Header.Get("Origin"))
+	if frontendBase == "" {
+		frontendBase = strings.TrimSpace(os.Getenv("FRONTEND_BASE_URL"))
+	}
+	if frontendBase == "" {
+		frontendBase = "http://localhost:5173"
+	}
+
+	q := url.Values{}
+	q.Set("plan", body.Plan)
+	q.Set("billing", body.BillingCycle)
+	q.Set("provider", "stripe")
+	successURL := frontendBase + "/payment?" + q.Encode() + "&status=success&session_id={CHECKOUT_SESSION_ID}"
+	cancelURL := frontendBase + "/payment?" + q.Encode() + "&status=cancel"
+
+	form := url.Values{}
+	form.Set("mode", "subscription")
+	form.Set("success_url", successURL)
+	form.Set("cancel_url", cancelURL)
+	form.Set("client_reference_id", userID)
+	form.Set("customer_email", email)
+	form.Set("metadata[plan]", body.Plan)
+	form.Set("metadata[billing_cycle]", body.BillingCycle)
+	form.Set("metadata[user_id]", userID)
+	form.Set("line_items[0][quantity]", "1")
+	form.Set("line_items[0][price_data][currency]", "usd")
+	form.Set("line_items[0][price_data][unit_amount]", strconv.FormatInt(unitAmount, 10))
+	form.Set("line_items[0][price_data][recurring][interval]", interval)
+	form.Set("line_items[0][price_data][product_data][name]", fmt.Sprintf("%s (%s)", displayName, strings.Title(body.BillingCycle)))
+
+	respBody, status, err := stripeAPIRequest(http.MethodPost, "/v1/checkout/sessions", form)
+	if err != nil {
+		log.Printf("[stripe] checkout create error: %v", err)
+		http.Error(w, "failed to create checkout session", http.StatusInternalServerError)
+		return
+	}
+	if status >= 300 {
+		log.Printf("[stripe] checkout create failed (%d): %s", status, string(respBody))
+		http.Error(w, "failed to create checkout session", http.StatusBadRequest)
+		return
+	}
+
+	var session struct {
+		ID  string `json:"id"`
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(respBody, &session); err != nil || strings.TrimSpace(session.URL) == "" {
+		log.Printf("[stripe] invalid checkout response: %s", string(respBody))
+		http.Error(w, "invalid checkout response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"session_id": session.ID,
+		"url":        session.URL,
+	})
+}
+
+func handleStripeSuccess(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	sessionID := strings.TrimSpace(body.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(r.URL.Query().Get("session_id"))
+	}
+	if sessionID == "" {
+		http.Error(w, "missing session_id", http.StatusBadRequest)
+		return
+	}
+
+	respBody, status, err := stripeAPIRequest(http.MethodGet, "/v1/checkout/sessions/"+url.PathEscape(sessionID)+"?expand[]=subscription", nil)
+	if err != nil {
+		log.Printf("[stripe] session lookup error: %v", err)
+		http.Error(w, "failed to verify session", http.StatusInternalServerError)
+		return
+	}
+	if status >= 300 {
+		log.Printf("[stripe] session lookup failed (%d): %s", status, string(respBody))
+		http.Error(w, "invalid Stripe session", http.StatusBadRequest)
+		return
+	}
+
+	var session struct {
+		ID                string            `json:"id"`
+		Status            string            `json:"status"`
+		ClientReferenceID string            `json:"client_reference_id"`
+		Metadata          map[string]string `json:"metadata"`
+		Subscription      interface{}       `json:"subscription"`
+	}
+	if err := json.Unmarshal(respBody, &session); err != nil {
+		http.Error(w, "invalid Stripe response", http.StatusBadRequest)
+		return
+	}
+	if session.Status != "complete" {
+		http.Error(w, "checkout not complete", http.StatusBadRequest)
+		return
+	}
+
+	userID := r.Context().Value(contextKeyUserID).(string)
+	email, _ := r.Context().Value(contextKeyEmail).(string)
+	if session.ClientReferenceID != "" && session.ClientReferenceID != userID {
+		http.Error(w, "session does not belong to user", http.StatusForbidden)
+		return
+	}
+
+	plan := strings.ToLower(strings.TrimSpace(session.Metadata["plan"]))
+	billingCycle := strings.ToLower(strings.TrimSpace(session.Metadata["billing_cycle"]))
+	if plan == "" {
+		plan = "starter"
+	}
+	if billingCycle == "" {
+		billingCycle = "monthly"
+	}
+	if billingCycle != "monthly" && billingCycle != "yearly" {
+		http.Error(w, "invalid billing cycle", http.StatusBadRequest)
+		return
+	}
+
+	var planExists bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM package_plans WHERE id = $1)`, plan).Scan(&planExists); err != nil {
+		log.Printf("[stripe] Error validating plan %q for user %s: %v", plan, userID, err)
+		http.Error(w, "failed to validate plan", http.StatusInternalServerError)
+		return
+	}
+	if !planExists {
+		http.Error(w, "invalid plan", http.StatusBadRequest)
+		return
+	}
+
+	subscriptionID := ""
+	switch v := session.Subscription.(type) {
+	case string:
+		subscriptionID = strings.TrimSpace(v)
+	case map[string]interface{}:
+		if idVal, ok := v["id"].(string); ok {
+			subscriptionID = strings.TrimSpace(idVal)
+		}
+	}
+	if subscriptionID == "" {
+		subscriptionID = session.ID
+	}
+
+	if _, err := ensureStation(userID, email, "", ""); err != nil {
+		log.Printf("[stripe] Error ensuring station for user %s: %v", userID, err)
+		http.Error(w, "failed to prepare station", http.StatusInternalServerError)
+		return
+	}
+
+	upgradeID, err := generateKey()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var oldPlan, oldBillingCycle string
+	if err := tx.QueryRow(`SELECT plan, billing_cycle FROM stations WHERE user_id = $1 FOR UPDATE`, userID).
+		Scan(&oldPlan, &oldBillingCycle); err != nil {
+		log.Printf("[stripe] Error loading current plan for user %s: %v", userID, err)
+		http.Error(w, "failed to load current plan", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = tx.Exec(`
+		UPDATE stations
+		SET stripe_subscription_id = $1, is_suspended = false, plan = $2, billing_cycle = $3
+		WHERE user_id = $4
+	`, subscriptionID, plan, billingCycle, userID)
+	if err != nil {
+		log.Printf("[stripe] Error saving subscription: %v", err)
+		http.Error(w, "error saving subscription", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO package_upgrade_history
+			(id, user_id, old_plan, new_plan, old_billing_cycle, new_billing_cycle, status, payment_reference)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7)`,
+		upgradeID, userID, oldPlan, plan, oldBillingCycle, billingCycle, subscriptionID,
+	); err != nil {
+		log.Printf("[stripe] Error recording subscription history for user %s: %v", userID, err)
+		http.Error(w, "failed to record subscription", http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[stripe] Error committing subscription for user %s: %v", userID, err)
+		http.Error(w, "error saving subscription", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[stripe] Subscription %s linked to user %s", subscriptionID, userID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Subscription activated",
+	})
+}
+
+func handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "error reading body", http.StatusBadRequest)
+		return
+	}
+	if !verifyStripeWebhookSignature(r.Header.Get("Stripe-Signature"), body) {
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
+
+	var event struct {
+		Type string `json:"type"`
+		Data struct {
+			Object json.RawMessage `json:"object"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &event); err != nil {
+		http.Error(w, "invalid webhook payload", http.StatusBadRequest)
+		return
+	}
+
+	switch event.Type {
+	case "checkout.session.completed":
+		var obj struct {
+			ID                string            `json:"id"`
+			ClientReferenceID string            `json:"client_reference_id"`
+			Metadata          map[string]string `json:"metadata"`
+			Subscription      interface{}       `json:"subscription"`
+		}
+		if err := json.Unmarshal(event.Data.Object, &obj); err == nil {
+			subscriptionID := ""
+			switch v := obj.Subscription.(type) {
+			case string:
+				subscriptionID = strings.TrimSpace(v)
+			case map[string]interface{}:
+				if idVal, ok := v["id"].(string); ok {
+					subscriptionID = strings.TrimSpace(idVal)
+				}
+			}
+			if subscriptionID == "" {
+				subscriptionID = strings.TrimSpace(obj.ID)
+			}
+			plan := strings.ToLower(strings.TrimSpace(obj.Metadata["plan"]))
+			billingCycle := strings.ToLower(strings.TrimSpace(obj.Metadata["billing_cycle"]))
+			if billingCycle != "monthly" && billingCycle != "yearly" {
+				billingCycle = ""
+			}
+			_, _ = db.Exec(`
+				UPDATE stations
+				SET stripe_subscription_id = $1,
+				    is_suspended = false,
+				    plan = CASE WHEN $2 <> '' THEN $2 ELSE plan END,
+				    billing_cycle = CASE WHEN $3 <> '' THEN $3 ELSE billing_cycle END
+				WHERE user_id = $4
+			`, subscriptionID, plan, billingCycle, obj.ClientReferenceID)
+		}
+
+	case "invoice.paid":
+		subscriptionID := extractStringValue(event.Data.Object, "subscription")
+		if subscriptionID != "" {
+			_, _ = db.Exec(`UPDATE stations SET is_suspended = false WHERE stripe_subscription_id = $1`, subscriptionID)
+		}
+
+	case "invoice.payment_failed", "customer.subscription.deleted":
+		subscriptionID := extractStringValue(event.Data.Object, "subscription")
+		if subscriptionID == "" {
+			subscriptionID = extractStringValue(event.Data.Object, "id")
+		}
+		if subscriptionID != "" {
+			_, _ = db.Exec(`UPDATE stations SET is_suspended = true WHERE stripe_subscription_id = $1`, subscriptionID)
+		}
+
+	case "customer.subscription.updated":
+		subscriptionID := extractStringValue(event.Data.Object, "id")
+		status := strings.ToLower(extractStringValue(event.Data.Object, "status"))
+		if subscriptionID != "" {
+			if status == "active" || status == "trialing" {
+				_, _ = db.Exec(`UPDATE stations SET is_suspended = false WHERE stripe_subscription_id = $1`, subscriptionID)
+			} else if status == "past_due" || status == "unpaid" || status == "canceled" {
+				_, _ = db.Exec(`UPDATE stations SET is_suspended = true WHERE stripe_subscription_id = $1`, subscriptionID)
+			}
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
 }
 
 // ── PayPal Plan Sync (Admin) ──────────────────────────────────────────────────
@@ -5802,6 +6273,11 @@ func main() {
 	mux.HandleFunc("/api/paypal/create-subscription", requireAuth(handlePayPalCreateSubscription))
 	mux.HandleFunc("/api/paypal/webhook", handlePayPalWebhook)
 	mux.HandleFunc("/api/paypal/success", requireAuth(handlePayPalSuccess))
+
+	// ── Stripe Subscription API ───────────────────────────────────────────────
+	mux.HandleFunc("/api/stripe/create-checkout-session", requireAuth(handleStripeCreateCheckoutSession))
+	mux.HandleFunc("/api/stripe/webhook", handleStripeWebhook)
+	mux.HandleFunc("/api/stripe/success", requireAuth(handleStripeSuccess))
 
 	// ── Super Admin API ───────────────────────────────────────────────────────
 	mux.HandleFunc("/api/admin/users", requireAdmin(handleAdminUsers))
