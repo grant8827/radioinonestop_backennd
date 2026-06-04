@@ -2521,6 +2521,36 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 		username = username[:64]
 	}
 
+	identityBytes := make([]byte, 6)
+	if _, err := rand.Read(identityBytes); err != nil {
+		http.Error(w, "failed to generate participant identity", http.StatusInternalServerError)
+		return
+	}
+	identityBase := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + 32
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-' || r == '_':
+			return r
+		case r == ' ' || r == '.':
+			return '-'
+		default:
+			return -1
+		}
+	}, username)
+	identityBase = strings.Trim(identityBase, "-_")
+	if identityBase == "" {
+		identityBase = "guest"
+	}
+	participantIdentity := fmt.Sprintf("%s-%s", identityBase, hex.EncodeToString(identityBytes))
+	if len(participantIdentity) > 96 {
+		participantIdentity = participantIdentity[len(participantIdentity)-96:]
+	}
+
 	apiKey := os.Getenv("LIVEKIT_API_KEY")
 	apiSecret := os.Getenv("LIVEKIT_API_SECRET")
 	livekitURL := os.Getenv("LIVEKIT_URL")
@@ -2541,7 +2571,7 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 		CanSubscribe: &canSubscribe,
 	}
 	at.AddGrant(grant).
-		SetIdentity(username).
+		SetIdentity(participantIdentity).
 		SetName(username).
 		SetValidFor(2 * time.Hour)
 
@@ -5081,10 +5111,10 @@ func handlePublicPricing(w http.ResponseWriter, r *http.Request) {
 // ── PayPal Subscription Integration ──────────────────────────────────────────
 
 var (
-	paypalClientID = os.Getenv("PAYPAL_CLIENT_ID")
-	paypalSecret   = os.Getenv("PAYPAL_SECRET")
-	paypalMode     = os.Getenv("PAYPAL_MODE") // "sandbox" or "live"
-	stripeSecretKey    = os.Getenv("STRIPE_SECRET_KEY")
+	paypalClientID      = os.Getenv("PAYPAL_CLIENT_ID")
+	paypalSecret        = os.Getenv("PAYPAL_SECRET")
+	paypalMode          = os.Getenv("PAYPAL_MODE") // "sandbox" or "live"
+	stripeSecretKey     = os.Getenv("STRIPE_SECRET_KEY")
 	stripeWebhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
 )
 
@@ -5488,11 +5518,11 @@ func handleStripeCreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		displayName       string
-		monthlyPrice      float64
-		yearlyPrice       float64
-		monthlySale       int
-		yearlySale        int
+		displayName  string
+		monthlyPrice float64
+		yearlyPrice  float64
+		monthlySale  int
+		yearlySale   int
 	)
 	err := db.QueryRow(`
 		SELECT display_name, monthly_price, yearly_price,
