@@ -1852,6 +1852,8 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stationSlug, _ := ensureStation(userID, body.Email, body.StationName, body.LogoURL)
+	// New accounts stay inactive until payment is completed or an admin activates them.
+	_, _ = db.Exec(`UPDATE stations SET is_suspended = true WHERE user_id = $1`, userID)
 	// Store genre and description if station was created
 	if stationSlug != "" && (body.Genre != "" || body.Description != "") {
 		_, _ = db.Exec(
@@ -1935,10 +1937,11 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 		var firstName, lastName string
 		_ = db.QueryRow(`SELECT first_name, last_name FROM users WHERE id = $1`, userID).Scan(&firstName, &lastName)
 		var stationName, genre, description, logoURL, stationSlug, plan, billingCycle string
-		_ = db.QueryRow(`SELECT station_name, genre, description, logo_url, station_slug, plan, billing_cycle FROM stations WHERE user_id = $1`, userID).
-			Scan(&stationName, &genre, &description, &logoURL, &stationSlug, &plan, &billingCycle)
+		var isSuspended bool
+		_ = db.QueryRow(`SELECT station_name, genre, description, logo_url, station_slug, plan, billing_cycle, is_suspended FROM stations WHERE user_id = $1`, userID).
+			Scan(&stationName, &genre, &description, &logoURL, &stationSlug, &plan, &billingCycle, &isSuspended)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		json.NewEncoder(w).Encode(map[string]interface{}{
 			"email":         email,
 			"first_name":    firstName,
 			"last_name":     lastName,
@@ -1949,6 +1952,7 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 			"listen_url":    "/listen/" + stationSlug,
 			"plan":          plan,
 			"billing_cycle": billingCycle,
+			"is_suspended":  isSuspended,
 		})
 
 	case http.MethodPut:
