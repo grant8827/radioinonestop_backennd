@@ -3925,9 +3925,20 @@ func handleRelayStart(w http.ResponseWriter, r *http.Request) {
 	args := []string{
 		"-rtsp_transport", "tcp",
 		"-i", rtspSrc,
+		// Transcode to H.264/AAC for maximum compatibility with Social Media
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-tune", "zerolatency",
+		"-profile:v", "main",
+		"-pix_fmt", "yuv420p", // Required for most social media players
+		"-g", "60", // 2-second keyframe interval at 30fps
+		"-c:a", "aac",
+		"-b:a", "128k",
+		"-ar", "44100",
 	}
 	for _, dest := range dests {
-		args = append(args, "-c:v", "copy", "-c:a", "copy", "-f", "flv", dest)
+		// Output to RTMP destination
+		args = append(args, "-f", "flv", dest)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
