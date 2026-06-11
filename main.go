@@ -21,6 +21,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -41,6 +42,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -2423,6 +2426,182 @@ func handleSaveCredentials(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// handleDestinations provides REST CRUD for stream destinations.
+// GET /api/destinations
+// POST /api/destinations
+// PUT /api/destinations/{id}
+// DELETE /api/destinations/{id}
+func handleDestinations(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(contextKeyUserID).(string)
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/destinations"), "/")
+
+	type destinationPayload struct {
+		Name      string `json:"name"`
+		ServerURL string `json:"serverUrl"`
+		StreamKey string `json:"streamKey"`
+		Enabled   bool   `json:"enabled"`
+		Platform  string `json:"platform"`
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		rows, err := db.Query(`
+			SELECT id, platform, label, rtmp_url, stream_key, enabled
+			FROM destinations
+			WHERE user_id = $1
+			ORDER BY updated_at DESC
+		`, userID)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		type destinationResp struct {
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			ServerURL string `json:"serverUrl"`
+			StreamKey string `json:"streamKey"`
+			Enabled   bool   `json:"enabled"`
+			Platform  string `json:"platform"`
+		}
+
+		resp := make([]destinationResp, 0)
+		for rows.Next() {
+			var d destinationResp
+			var enabled int
+			if err := rows.Scan(&d.ID, &d.Platform, &d.Name, &d.ServerURL, &d.StreamKey, &enabled); err != nil {
+				continue
+			}
+			d.Enabled = enabled == 1
+			resp = append(resp, d)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"destinations": resp})
+		return
+
+	case http.MethodPost:
+		var body destinationPayload
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		name := strings.TrimSpace(body.Name)
+		serverURL := strings.TrimRight(strings.TrimSpace(body.ServerURL), "/")
+		streamKey := strings.TrimSpace(body.StreamKey)
+		platform := strings.TrimSpace(body.Platform)
+		if platform == "" {
+			platform = "custom"
+		}
+		if name == "" || serverURL == "" || streamKey == "" {
+			http.Error(w, "name, serverUrl, and streamKey are required", http.StatusBadRequest)
+			return
+		}
+		if !strings.HasPrefix(strings.ToLower(serverURL), "rtmp://") && !strings.HasPrefix(strings.ToLower(serverURL), "rtmps://") {
+			http.Error(w, "serverUrl must start with rtmp:// or rtmps://", http.StatusBadRequest)
+			return
+		}
+
+		destinationID, err := generateKey()
+		if err != nil {
+			http.Error(w, "could not create destination", http.StatusInternalServerError)
+			return
+		}
+
+		enabled := 0
+		if body.Enabled {
+			enabled = 1
+		}
+
+		if _, err := db.Exec(`
+			INSERT INTO destinations (id, user_id, platform, label, rtmp_url, server_url, stream_key, enabled, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8)
+		`, destinationID, userID, platform, name, serverURL, streamKey, enabled, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "id": destinationID})
+		return
+
+	case http.MethodPut:
+		if id == "" {
+			http.Error(w, "destination id required", http.StatusBadRequest)
+			return
+		}
+		var body destinationPayload
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		name := strings.TrimSpace(body.Name)
+		serverURL := strings.TrimRight(strings.TrimSpace(body.ServerURL), "/")
+		streamKey := strings.TrimSpace(body.StreamKey)
+		platform := strings.TrimSpace(body.Platform)
+		if platform == "" {
+			platform = "custom"
+		}
+		if name == "" || serverURL == "" || streamKey == "" {
+			http.Error(w, "name, serverUrl, and streamKey are required", http.StatusBadRequest)
+			return
+		}
+		if !strings.HasPrefix(strings.ToLower(serverURL), "rtmp://") && !strings.HasPrefix(strings.ToLower(serverURL), "rtmps://") {
+			http.Error(w, "serverUrl must start with rtmp:// or rtmps://", http.StatusBadRequest)
+			return
+		}
+
+		enabled := 0
+		if body.Enabled {
+			enabled = 1
+		}
+
+		res, err := db.Exec(`
+			UPDATE destinations
+			SET platform = $1, label = $2, rtmp_url = $3, server_url = $3, stream_key = $4, enabled = $5, updated_at = $6
+			WHERE id = $7 AND user_id = $8
+		`, platform, name, serverURL, streamKey, enabled, time.Now().UTC().Format(time.RFC3339), id, userID)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+
+	case http.MethodDelete:
+		if id == "" {
+			http.Error(w, "destination id required", http.StatusBadRequest)
+			return
+		}
+		res, err := db.Exec(`DELETE FROM destinations WHERE id = $1 AND user_id = $2`, id, userID)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+}
+
 // getDestinationsForKey returns the enabled RTMP forwarding target URLs
 // for the user whose stream_key matches the given key.
 func getDestinationsForKey(streamKey string) []string {
@@ -2458,7 +2637,7 @@ func getDestinationsForKey(streamKey string) []string {
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -3860,11 +4039,259 @@ func mediamtxRTSPBase() string {
 
 // webRelayManager maps userID → running relay cancel function.
 type webRelayManager struct {
-	mu     sync.Mutex
-	relays map[string]context.CancelFunc
+	mu       sync.Mutex
+	sessions map[string]*ActiveSession
 }
 
-var webRelay = &webRelayManager{relays: make(map[string]context.CancelFunc)}
+// ActiveSession tracks a single running relay process.
+type ActiveSession struct {
+	mu           sync.Mutex
+	Cmd          *exec.Cmd
+	Cancel       context.CancelFunc
+	UserID       string
+	Path         string
+	StartedAt    time.Time
+	Destinations []string
+}
+
+type relayMetricsState struct {
+	mu        sync.RWMutex
+	fps       float64
+	bandwidth float64
+	cpu       float64
+	updatedAt time.Time
+}
+
+var webRelay = &webRelayManager{sessions: make(map[string]*ActiveSession)}
+var relayMetrics = &relayMetricsState{}
+
+var (
+	ffmpegFPSRe     = regexp.MustCompile(`fps=\s*([0-9]+(?:\.[0-9]+)?)`)
+	ffmpegBitrateRe = regexp.MustCompile(`bitrate=\s*([0-9]+(?:\.[0-9]+)?)kbits/s`)
+)
+
+func (m *webRelayManager) replace(userID string, session *ActiveSession) {
+	m.mu.Lock()
+	old := m.sessions[userID]
+	m.sessions[userID] = session
+	m.mu.Unlock()
+	if old != nil {
+		stopActiveSession(old)
+	}
+}
+
+func (m *webRelayManager) stop(userID string) bool {
+	m.mu.Lock()
+	s := m.sessions[userID]
+	if s != nil {
+		delete(m.sessions, userID)
+	}
+	m.mu.Unlock()
+	if s != nil {
+		stopActiveSession(s)
+		return true
+	}
+	return false
+}
+
+func (m *webRelayManager) deleteIfMatch(userID string, session *ActiveSession) {
+	m.mu.Lock()
+	if m.sessions[userID] == session {
+		delete(m.sessions, userID)
+	}
+	m.mu.Unlock()
+}
+
+func (m *webRelayManager) activeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions)
+}
+
+func stopActiveSession(s *ActiveSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Cancel != nil {
+		s.Cancel()
+	}
+	if s.Cmd != nil && s.Cmd.Process != nil {
+		_ = s.Cmd.Process.Kill()
+	}
+}
+
+func setRelayMetrics(fps, bandwidth float64) {
+	relayMetrics.mu.Lock()
+	if fps >= 0 {
+		relayMetrics.fps = fps
+	}
+	if bandwidth >= 0 {
+		relayMetrics.bandwidth = bandwidth
+	}
+	relayMetrics.updatedAt = time.Now()
+	relayMetrics.mu.Unlock()
+}
+
+func setRelayCPU(cpu float64) {
+	relayMetrics.mu.Lock()
+	relayMetrics.cpu = cpu
+	relayMetrics.updatedAt = time.Now()
+	relayMetrics.mu.Unlock()
+}
+
+func getRelayMetrics() (cpu, bandwidth, fps float64) {
+	relayMetrics.mu.RLock()
+	defer relayMetrics.mu.RUnlock()
+	return relayMetrics.cpu, relayMetrics.bandwidth, relayMetrics.fps
+}
+
+func processFFmpegProgressLine(line string) {
+	fps := -1.0
+	bw := -1.0
+	if m := ffmpegFPSRe.FindStringSubmatch(line); len(m) == 2 {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+			fps = v
+		}
+	}
+	if m := ffmpegBitrateRe.FindStringSubmatch(line); len(m) == 2 {
+		if kbps, err := strconv.ParseFloat(m[1], 64); err == nil {
+			bw = kbps / 1000.0
+		}
+	}
+	if fps >= 0 || bw >= 0 {
+		setRelayMetrics(fps, bw)
+	}
+}
+
+func sampleSystemCPU() float64 {
+	cmd := exec.Command("sh", "-c", "ps -A -o %cpu | awk 'NR>1 {s+=$1} END {print s+0}'")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0
+	}
+	cores := runtime.NumCPU()
+	if cores > 0 {
+		v = v / float64(cores)
+	}
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+func startMetricsWorker() {
+	t := time.NewTicker(1 * time.Second)
+	go func() {
+		defer t.Stop()
+		for range t.C {
+			setRelayCPU(sampleSystemCPU())
+		}
+	}()
+}
+
+func getActiveDestinationURLs(userID string) ([]string, error) {
+	rows, err := db.Query(`
+		SELECT rtmp_url, stream_key FROM destinations
+		WHERE user_id = $1 AND enabled = 1 AND stream_key != '' AND rtmp_url != ''
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var dests []string
+	for rows.Next() {
+		var rtmpURL, key string
+		if err := rows.Scan(&rtmpURL, &key); err == nil {
+			dests = append(dests, strings.TrimRight(rtmpURL, "/")+"/"+strings.TrimLeft(key, "/"))
+		}
+	}
+	return dests, nil
+}
+
+func buildRelayFFmpegArgs(rtspSrc string, destinations []string) []string {
+	args := []string{
+		"-rtsp_transport", "tcp",
+		"-i", rtspSrc,
+		"-c:v", "copy",
+		"-c:a", "copy",
+	}
+	for _, dest := range destinations {
+		args = append(args, "-f", "flv", dest)
+	}
+	return args
+}
+
+func startRelayForUser(userID, path string) (int, error) {
+	if isStreamingDisabled(userID) {
+		return 0, errors.New("streaming disabled - listener limit exceeded")
+	}
+
+	dests, err := getActiveDestinationURLs(userID)
+	if err != nil {
+		return 0, err
+	}
+	if len(dests) == 0 {
+		return 0, nil
+	}
+
+	cleanPath := strings.Trim(path, "/")
+	if cleanPath == "" {
+		return 0, errors.New("path required")
+	}
+
+	rtspSrc := mediamtxRTSPBase() + "/" + cleanPath
+	args := buildRelayFFmpegArgs(rtspSrc, dests)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd.Stdout = os.Stdout
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return 0, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return 0, err
+	}
+
+	session := &ActiveSession{
+		Cmd:          cmd,
+		Cancel:       cancel,
+		UserID:       userID,
+		Path:         cleanPath,
+		StartedAt:    time.Now(),
+		Destinations: dests,
+	}
+	webRelay.replace(userID, session)
+
+	go func() {
+		scanner := bufio.NewScanner(stderrPipe)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			processFFmpegProgressLine(line)
+			log.Printf("[relay/%s] %s", userID, line)
+		}
+	}()
+
+	go func(s *ActiveSession, c context.Context) {
+		defer cancel()
+		if err := cmd.Wait(); err != nil && c.Err() == nil {
+			log.Printf("[relay] FFmpeg exited user=%s path=%s: %v", userID, cleanPath, err)
+		}
+		webRelay.deleteIfMatch(userID, s)
+	}(session, ctx)
+
+	log.Printf("[relay] started user=%s path=%s destinations=%d", userID, cleanPath, len(dests))
+	return len(dests), nil
+}
 
 // POST /api/stream/relay/start
 // Body: {"path": "<mediamtx-path>"} — the path the browser published to via WHIP.
@@ -3877,12 +4304,6 @@ func handleRelayStart(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := r.Context().Value(contextKeyUserID).(string)
 
-	// Check if streaming is disabled due to exceeding listener limit
-	if isStreamingDisabled(userID) {
-		http.Error(w, "streaming disabled - listener limit exceeded", http.StatusForbidden)
-		return
-	}
-
 	var body struct {
 		Path string `json:"path"`
 	}
@@ -3891,26 +4312,17 @@ func handleRelayStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load active destinations for this user.
-	rows, err := db.Query(`
-		SELECT rtmp_url, stream_key FROM destinations
-		WHERE user_id = $1 AND enabled = 1 AND stream_key != '' AND rtmp_url != ''
-	`, userID)
+	destinationCount, err := startRelayForUser(userID, body.Path)
 	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
+		if strings.Contains(err.Error(), "disabled") {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		http.Error(w, "relay start failed", http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
 
-	var dests []string
-	for rows.Next() {
-		var rtmpURL, key string
-		if err := rows.Scan(&rtmpURL, &key); err == nil {
-			dests = append(dests, strings.TrimRight(rtmpURL, "/")+"/"+strings.TrimLeft(key, "/"))
-		}
-	}
-
-	if len(dests) == 0 {
+	if destinationCount == 0 {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":   "ok",
@@ -3919,67 +4331,11 @@ func handleRelayStart(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
-	// Build FFmpeg args: pull via RTSP, stream-copy to each destination.
-	rtspSrc := mediamtxRTSPBase() + "/" + body.Path
-	args := []string{
-		"-rtsp_transport", "tcp",
-		"-i", rtspSrc,
-		// Transcode to H.264/AAC for maximum compatibility with Social Media
-		"-c:v", "libx264",
-		"-preset", "veryfast",
-		"-tune", "zerolatency",
-		"-profile:v", "main",
-		"-pix_fmt", "yuv420p", // Required for most social media players
-		"-g", "60", // 2-second keyframe interval at 30fps
-		"-c:a", "aac",
-		"-b:a", "128k",
-		"-ar", "44100",
-	}
-	for _, dest := range dests {
-		// Output to RTMP destination
-		args = append(args, "-f", "flv", dest)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		log.Printf("[relay] start error user=%s: %v", userID, err)
-		http.Error(w, "relay start failed", http.StatusInternalServerError)
-		return
-	}
-
-	// Replace any previous relay for this user.
-	webRelay.mu.Lock()
-	if old, ok := webRelay.relays[userID]; ok {
-		old()
-	}
-	webRelay.relays[userID] = cancel
-	webRelay.mu.Unlock()
-
-	// Watch the process; clean up when it exits.
-	go func() {
-		defer cancel()
-		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-			log.Printf("[relay] FFmpeg exited user=%s path=%s: %v", userID, body.Path, err)
-		}
-		webRelay.mu.Lock()
-		if webRelay.relays[userID] != nil {
-			delete(webRelay.relays, userID)
-		}
-		webRelay.mu.Unlock()
-	}()
-
-	log.Printf("[relay] started user=%s path=%s destinations=%d", userID, body.Path, len(dests))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":       "ok",
 		"relaying":     true,
-		"destinations": len(dests),
+		"destinations": destinationCount,
 	})
 }
 
@@ -3991,17 +4347,218 @@ func handleRelayStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := r.Context().Value(contextKeyUserID).(string)
-
-	webRelay.mu.Lock()
-	cancel, ok := webRelay.relays[userID]
-	if ok {
-		cancel()
-		delete(webRelay.relays, userID)
-	}
-	webRelay.mu.Unlock()
+	ok := webRelay.stop(userID)
 
 	log.Printf("[relay] stopped user=%s (was_running=%v)", userID, ok)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// POST /api/stream/status
+// Body: {"action":"publish|done","user":"<stream_key>","path":"live/<stream_key>"}
+// This endpoint is designed for MediaMTX runOnPublish/runOnUnpublish callbacks.
+func handleStreamLifecycleWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if expected := strings.TrimSpace(os.Getenv("STREAM_STATUS_TOKEN")); expected != "" {
+		if r.Header.Get("X-Stream-Status-Token") != expected {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
+	var body struct {
+		Action string `json:"action"`
+		User   string `json:"user"`
+		Path   string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	action := strings.ToLower(strings.TrimSpace(body.Action))
+	pathValue := strings.Trim(strings.TrimSpace(body.Path), "/")
+	userValue := strings.Trim(strings.TrimSpace(body.User), "/")
+	if pathValue == "" {
+		pathValue = userValue
+	}
+
+	streamKey := userValue
+	if streamKey == "" {
+		streamKey = pathValue
+	}
+	if strings.Contains(streamKey, "/") {
+		parts := strings.Split(streamKey, "/")
+		streamKey = parts[len(parts)-1]
+	}
+
+	if streamKey == "" {
+		http.Error(w, "stream user/key required", http.StatusBadRequest)
+		return
+	}
+	userID := getUserIDFromStreamKey(streamKey)
+	if userID == "" {
+		http.Error(w, "unknown stream key", http.StatusNotFound)
+		return
+	}
+
+	switch action {
+	case "publish":
+		count, err := startRelayForUser(userID, pathValue)
+		if err != nil {
+			if strings.Contains(err.Error(), "disabled") {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
+			http.Error(w, "relay start failed", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":       "ok",
+			"action":       "publish",
+			"destinations": count,
+		})
+		return
+	case "done", "unpublish":
+		stopped := webRelay.stop(userID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"action":  "done",
+			"stopped": stopped,
+		})
+		return
+	default:
+		http.Error(w, "unsupported action", http.StatusBadRequest)
+		return
+	}
+}
+
+// GET /api/metrics
+func handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cpu, bandwidth, fps := getRelayMetrics()
+	if cpu <= 0 {
+		cpu = sampleSystemCPU()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"cpu":            cpu,
+		"bandwidth":      bandwidth,
+		"fps":            fps,
+		"active_streams": webRelay.activeCount(),
+	})
+}
+
+// POST /api/stream/auth
+// Body: {"user":"<stream_key>"} or {"streamKey":"<stream_key>"}
+// Returns 200 when publish is allowed, 403 when blocked.
+// handleStreamAuth is called by MediaMTX's externalAuthenticationURL for every
+// publish/read attempt.  MediaMTX sends a POST with JSON:
+//
+//	{"ip":"…","user":"…","password":"…","path":"live/<key>","protocol":"rtmp",
+//	 "id":"…","action":"publish","query":"…"}
+//
+// The stream key is the last segment of "path" (after the app name).
+// We also accept our own internal format: {"user":"<key>"} or {"streamKey":"<key>"}.
+//
+// Returns 200 to allow, 403 to reject so MediaMTX closes the socket immediately.
+func handleStreamAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Optional shared-secret check so external callers can't spoof the callback.
+	if expected := strings.TrimSpace(os.Getenv("STREAM_AUTH_TOKEN")); expected != "" {
+		if r.Header.Get("X-Stream-Auth-Token") != expected {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
+	// MediaMTX external-auth payload (superset of our own internal format).
+	var body struct {
+		// MediaMTX fields
+		Action   string `json:"action"`   // "publish" | "read"
+		Path     string `json:"path"`     // e.g. "live/abc123def" or "abc123def"
+		User     string `json:"user"`     // RTMP user / stream-key when set
+		Password string `json:"password"` // RTMP password field (unused here)
+		Protocol string `json:"protocol"` // "rtmp" | "rtsp" | "webrtc" …
+		IP       string `json:"ip"`
+		Query    string `json:"query"` // URL query string — some OBS versions put the key here
+		// Internal / legacy format
+		StreamKey string `json:"streamKey"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	// Readers (HLS / RTSP playback) are always allowed — we only gate publishers.
+	action := strings.ToLower(strings.TrimSpace(body.Action))
+	if action == "read" || action == "" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Extract the stream key from the path last segment, user field, or streamKey field.
+	key := strings.TrimSpace(body.StreamKey)
+	if key == "" {
+		key = strings.TrimSpace(body.User)
+	}
+	if key == "" {
+		// Take the last path segment: "live/abc123" → "abc123"
+		p := strings.Trim(strings.TrimSpace(body.Path), "/")
+		if idx := strings.LastIndex(p, "/"); idx >= 0 {
+			key = p[idx+1:]
+		} else {
+			key = p
+		}
+	}
+	if key == "" && body.Query != "" {
+		// e.g. ?streamkey=abc123 or ?key=abc123
+		if q, err := url.ParseQuery(body.Query); err == nil {
+			for _, qk := range []string{"streamkey", "key", "stream_key", "token"} {
+				if v := strings.TrimSpace(q.Get(qk)); v != "" {
+					key = v
+					break
+				}
+			}
+		}
+		if key == "" {
+			// Last resort: the query itself might just be the key with no parameter name.
+			key = strings.Trim(body.Query, "?/ ")
+		}
+	}
+
+	if key == "" {
+		// No key at all — deny.
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	userID := getUserIDFromStreamKey(key)
+	if userID == "" {
+		log.Printf("[stream/auth] rejected unknown key=%q ip=%s", key, body.IP)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if isStreamingDisabled(userID) {
+		log.Printf("[stream/auth] rejected disabled user=%s key=%q", userID, key)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	log.Printf("[stream/auth] allowed user=%s key=%q protocol=%s ip=%s", userID, key, body.Protocol, body.IP)
+	w.WriteHeader(http.StatusOK)
 }
 
 // ─── OAuth Stage 4 — Stream Key Provisioning ─────────────────────────────────
@@ -6253,12 +6810,19 @@ func main() {
 	}
 
 	// Start RTMP ingest server on :1935
-	go startRTMPServer(streams)
+	// DISABLE_GO_RTMP=1 → MediaMTX owns port 1935 exclusively;
+	// lifecycle is handled via /api/stream/status webhook callbacks.
+	if os.Getenv("DISABLE_GO_RTMP") != "1" {
+		go startRTMPServer(streams)
+	} else {
+		log.Printf("[rtmp] Go RTMP server disabled — MediaMTX is the ingest endpoint on :1935")
+	}
 
 	// GeoIP + Icecast analytics worker.
 	initGeoIP()
 	startAnalyticsWorker()
 	startWebListenerCleanup()
+	startMetricsWorker()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -6285,6 +6849,8 @@ func main() {
 	mux.HandleFunc("/api/auth/login", handleLogin)
 	mux.HandleFunc("/api/auth/", handleOAuthRoute) // platform OAuth connect + callback
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
+	mux.HandleFunc("/api/destinations", requireAuth(handleDestinations))
+	mux.HandleFunc("/api/destinations/", requireAuth(handleDestinations))
 	mux.HandleFunc("/api/user/profile", requireAuth(handleUserProfile))
 	mux.HandleFunc("/api/user/listener-status", requireAuth(handleListenerStatus))
 	mux.HandleFunc("/api/user/upgrade", requireAuth(handleUpgradePlan))
@@ -6293,8 +6859,11 @@ func main() {
 	mux.HandleFunc("/api/user/oauth-connections", requireAuth(handleOAuthConnections))
 	mux.HandleFunc("/api/user/oauth-connections/", requireAuth(handleOAuthConnections))
 	mux.HandleFunc("/api/user/oauth-stream-keys/sync", requireAuth(handleSyncOAuthStreamKeys))
+	mux.HandleFunc("/api/stream/status", handleStreamLifecycleWebhook)
+	mux.HandleFunc("/api/stream/auth", handleStreamAuth)
 	mux.HandleFunc("/api/stream/relay/start", requireAuth(handleRelayStart))
 	mux.HandleFunc("/api/stream/relay/stop", requireAuth(handleRelayStop))
+	mux.HandleFunc("/api/metrics", requireAuth(handleMetrics))
 	mux.HandleFunc("/api/stations/", handleGetStation)
 	mux.HandleFunc("/api/icecast/auth", handleIcecastAuth)
 	mux.HandleFunc("/api/listeners/start", handleListenerSession)
