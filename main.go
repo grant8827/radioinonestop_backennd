@@ -4216,12 +4216,30 @@ func buildRelayFFmpegArgs(rtspSrc string, destinations []string) []string {
 	args := []string{
 		"-rtsp_transport", "tcp",
 		"-i", rtspSrc,
-		"-c:v", "copy",
-		"-c:a", "copy",
+		// Transcode WebRTC (VP8/Opus) to RTMP/FLV (H.264/AAC)
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-b:v", "3000k",
+		"-maxrate", "3000k",
+		"-bufsize", "6000k",
+		"-pix_fmt", "yuv420p",
+		"-g", "60", // Keyframe interval (2s at 30fps)
+		"-c:a", "aac",
+		"-b:a", "160k",
+		"-ar", "44100",
 	}
-	for _, dest := range destinations {
-		args = append(args, "-f", "flv", dest)
+
+	if len(destinations) == 1 {
+		args = append(args, "-f", "flv", destinations[0])
+	} else if len(destinations) > 1 {
+		var teeOuts []string
+		for _, dest := range destinations {
+			// Use the tee muxer to push to multiple RTMP destinations efficiently
+			teeOuts = append(teeOuts, fmt.Sprintf("[f=flv]%s", dest))
+		}
+		args = append(args, "-f", "tee", strings.Join(teeOuts, "|"))
 	}
+
 	return args
 }
 
