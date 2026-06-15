@@ -4235,7 +4235,12 @@ func buildRelayFFmpegArgs(rtspSrc string, destinations []string) []string {
 		var teeOuts []string
 		for _, dest := range destinations {
 			// Use the tee muxer to push to multiple RTMP destinations efficiently
-			teeOuts = append(teeOuts, fmt.Sprintf("[f=flv]%s", dest))
+			escaped := dest
+			escaped = strings.ReplaceAll(escaped, "\\", "\\\\")
+			escaped = strings.ReplaceAll(escaped, "|", "\\|")
+			escaped = strings.ReplaceAll(escaped, "[", "\\[")
+			escaped = strings.ReplaceAll(escaped, "]", "\\]")
+			teeOuts = append(teeOuts, fmt.Sprintf("[f=flv]%s", escaped))
 		}
 		args = append(args, "-f", "tee", strings.Join(teeOuts, "|"))
 	}
@@ -4274,6 +4279,7 @@ func startRelayForUser(userID, path string) (int, error) {
 	}
 
 	if err := cmd.Start(); err != nil {
+		log.Printf("[relay] FFmpeg failed to start for user=%s: %v", userID, err)
 		cancel()
 		return 0, err
 	}
@@ -4406,6 +4412,10 @@ func handleStreamLifecycleWebhook(w http.ResponseWriter, r *http.Request) {
 	streamKey := userValue
 	if streamKey == "" {
 		streamKey = pathValue
+	}
+	// Fix for MediaMTX WHIP paths which end in /whip
+	if strings.HasSuffix(streamKey, "/whip") {
+		streamKey = strings.TrimSuffix(streamKey, "/whip")
 	}
 	if strings.Contains(streamKey, "/") {
 		parts := strings.Split(streamKey, "/")
