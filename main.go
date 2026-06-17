@@ -1267,6 +1267,15 @@ func pollMount(client *http.Client, base, user, pass, userID, streamKey string) 
 		log.Printf("[analytics] Icecast poller disabled: admin credentials rejected with status %d", resp.StatusCode)
 		return false
 	}
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
+		// Icecast returns 400/404 when a mount has no active source.
+		// Treat this as offline (zero listeners), not as an error.
+		activeSessionsMu.Lock()
+		closeAllSessions(userID)
+		activeSessionsMu.Unlock()
+		syncLiveListenerCount(userID)
+		return true
+	}
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[analytics] pollMount GET %s status %d", reqURL, resp.StatusCode)
 		activeSessionsMu.Lock()
@@ -3151,6 +3160,13 @@ func handleIcecastAuth(w http.ResponseWriter, r *http.Request) {
 		JOIN users u ON u.id = st.user_id
 		WHERE u.stream_key = $1
 	`, mount).Scan(&storedPassword)
+	sharedPass := strings.TrimSpace(os.Getenv("ICECAST_SOURCE_PASSWORD"))
+	if sharedPass != "" && pass == sharedPass {
+		log.Printf("[icecast-auth] allowed mount=/%s (shared secret)", mount)
+		allow()
+		return
+	}
+
 	if err != nil || storedPassword == "" || storedPassword != pass {
 		log.Printf("[icecast-auth] denied mount=/%s", mount)
 		deny()
@@ -3498,11 +3514,11 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	// services) without the browser needing to know it, and without requiring
 	// Icecast to make HTTP callbacks to the backend for URL auth.
 	icecastPass := cfg.Password
-	if envPass := os.Getenv("ICECAST_SOURCE_PASSWORD"); envPass != "" {
+	if envPass := strings.TrimSpace(os.Getenv("ICECAST_SOURCE_PASSWORD")); envPass != "" {
 		icecastPass = envPass
 	}
-	if icecastHostOverride != "" && strings.TrimSpace(os.Getenv("ICECAST_SOURCE_PASSWORD")) == "" {
-		sendStatus("error", "ICECAST_SOURCE_PASSWORD is not set on backend; set the same value on backend and Icecast services, or use Hub mode")
+	if strings.TrimSpace(icecastPass) == "" {
+		sendStatus("error", "Icecast source password is missing; provide encoder password or set ICECAST_SOURCE_PASSWORD")
 		return
 	}
 
@@ -3559,26 +3575,22 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	ffmpegDone := make(chan error, 1)
 	go func() { ffmpegDone <- cmd.Wait() }()
 
-	// ── Wait up to 3 s for early FFmpeg failure before declaring live ─────
-	// FFmpeg exits almost instantly on bad hostname/password; only after
-	// surviving this window do we tell the client the stream is live.
-	startupTimer := time.NewTimer(3 * time.Second)
-	select {
-	case err := <-ffmpegDone:
-		startupTimer.Stop()
-		sendStatus("error", ffmpegStatusMessage("FFmpeg failed to connect to Icecast", err, ffmpegStderr))
-		return
-	case <-startupTimer.C:
-		// still running — Icecast accepted the connection
+	liveMarked := false
+	markLive := func() {
+		if liveMarked {
+			return
+		}
+		liveMarked = true
+		icecastListenURL := "/icecast" + cfg.Mount
+		db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1, icecast_listen_url = $2 WHERE user_id = $3`, //nolint:errcheck
+			time.Now().UTC().Format(time.RFC3339), icecastListenURL, claims.UserID)
+		sendStatus("live", fmt.Sprintf("Streaming → %s:%s%s", cfg.Host, cfg.Port, cfg.Mount))
 	}
-
-	// Mark station live in DB so the home page card updates.
-	icecastListenURL := "/icecast" + cfg.Mount
-	db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1, icecast_listen_url = $2 WHERE user_id = $3`, //nolint:errcheck
-		time.Now().UTC().Format(time.RFC3339), icecastListenURL, claims.UserID)
-	defer db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, claims.UserID) //nolint:errcheck
-
-	sendStatus("live", fmt.Sprintf("Streaming → %s:%s%s", cfg.Host, cfg.Port, cfg.Mount))
+	defer func() {
+		if liveMarked {
+			db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, claims.UserID) //nolint:errcheck
+		}
+	}()
 
 	// ── Keepalive pings ────────────────────────────────────────────────────
 	// Railway (and most reverse proxies) will drop WebSocket connections that
@@ -3647,6 +3659,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		markLive()
 	}
 }
 
