@@ -1181,7 +1181,8 @@ func startAnalyticsWorker() {
 	}
 	icecastPass := os.Getenv("ICECAST_ADMIN_PASSWORD")
 	if icecastPass == "" {
-		icecastPass = "changeme123"
+		log.Printf("[analytics] Icecast poller disabled: ICECAST_ADMIN_PASSWORD is not set")
+		return
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
