@@ -1160,6 +1160,7 @@ var (
 	webListenerSessions   = map[string]*webListenerSession{}
 	webListenerSessionsMu sync.Mutex
 	icecastAnalyticsAuthFailed atomic.Bool
+	icecastAnalyticsPollCount  atomic.Uint64
 )
 
 func startAnalyticsWorker() {
@@ -1189,7 +1190,7 @@ func startAnalyticsWorker() {
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	go func() {
-		ticker := time.NewTicker(3 * time.Second)
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			if icecastAnalyticsAuthFailed.Load() {
@@ -1201,7 +1202,7 @@ func startAnalyticsWorker() {
 			}
 		}
 	}()
-	log.Printf("[analytics] Icecast poller started → %s", icecastBase)
+	log.Printf("[analytics] Icecast poller started → %s (interval=15s)", icecastBase)
 }
 
 // pollAllMounts fetches live mounts from the DB and polls each one.
@@ -1224,7 +1225,9 @@ func pollAllMounts(client *http.Client, base, user, pass string) bool {
 			live = append(live, mu)
 		}
 	}
-	log.Printf("[analytics] polling %d mount(s) via %s", len(live), base)
+	if n := icecastAnalyticsPollCount.Add(1); n == 1 || n%20 == 0 {
+		log.Printf("[analytics] polling %d mount(s) via %s", len(live), base)
+	}
 
 	// For users no longer live, close their open sessions.
 	activeSessionsMu.Lock()
