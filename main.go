@@ -3017,7 +3017,7 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 		return
 	}
 
-	db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1 WHERE user_id = $2`, //nolint:errcheck
+	db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1, icecast_listen_url = '' WHERE user_id = $2`, //nolint:errcheck
 		time.Now().UTC().Format(time.RFC3339), userID)
 
 	// ── Start FFmpeg: WebM/Opus → HLS (AAC + MPEG-TS segments) ─────────────
@@ -3082,7 +3082,7 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 		log.Printf("[hub/%s] HLS segments cleaned up", stationSlug)
 
 		closeHub(stationSlug, h)
-		db.Exec(`UPDATE stations SET is_live = false WHERE user_id = $1`, userID) //nolint:errcheck
+		db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, userID) //nolint:errcheck
 		log.Printf("[hub/%s] broadcaster disconnected", stationSlug)
 	}()
 
