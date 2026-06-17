@@ -3574,6 +3574,9 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[encoder/%s] started → %s:%s%s (codec=%s bitrate=%s)",
 		claims.UserID, cfg.Host, cfg.Port, cfg.Mount, codec, cfg.Bitrate)
+	// Signal readiness immediately so the browser starts pushing audio chunks.
+	// The DB live flag is still set only after we receive the first real bytes.
+	sendStatus("live", fmt.Sprintf("Encoder connected → %s:%s%s", cfg.Host, cfg.Port, cfg.Mount))
 
 	ffmpegDone := make(chan error, 1)
 	go func() { ffmpegDone <- cmd.Wait() }()
