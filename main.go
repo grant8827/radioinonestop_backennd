@@ -6860,6 +6860,16 @@ func main() {
 	}
 	log.Printf("[db] Connected to PostgreSQL")
 
+	// Process restarts tear down active encoders; clear stale live/mount state
+	// so the frontend does not keep trying dead Icecast URLs.
+	if _, err := db.Exec(`UPDATE stations
+		SET is_live = false,
+		    current_listeners_count = 0,
+		    icecast_listen_url = ''
+		WHERE is_live = true OR current_listeners_count <> 0 OR icecast_listen_url <> ''`); err != nil {
+		log.Printf("[db] stale live-state cleanup warning: %v", err)
+	}
+
 	// JWT secret — use JWT_SECRET env var or generate ephemeral secret.
 	if secret := os.Getenv("JWT_SECRET"); secret != "" {
 		jwtSecret = []byte(secret)
