@@ -3578,6 +3578,22 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	ffmpegDone := make(chan error, 1)
 	go func() { ffmpegDone <- cmd.Wait() }()
 
+	// Send a minimal silent WebM stream header so FFmpeg can establish the
+	// Icecast connection immediately, before the browser's MediaRecorder
+	// sends its first real audio chunk (~250 ms after the recorder starts).
+	// Without this, Icecast drops the source after source-timeout seconds
+	// because no audio data arrives during the handshake window.
+	// This is a valid WebM/Matroska EBML header + a silent audio segment.
+	silentWebM := []byte{
+		// EBML header
+		0x1a, 0x45, 0xdf, 0xa3, 0xa3, 0x42, 0x86, 0x81,
+		0x01, 0x42, 0xf7, 0x81, 0x01, 0x42, 0xf2, 0x81,
+		0x04, 0x42, 0xf3, 0x81, 0x08, 0x42, 0x82, 0x84,
+		0x77, 0x65, 0x62, 0x6d, 0x42, 0x87, 0x81, 0x04,
+		0x42, 0x85, 0x81, 0x02,
+	}
+	go func() { stdin.Write(silentWebM) }() //nolint:errcheck
+
 	liveMarked := false
 	markLive := func() {
 		if liveMarked {
