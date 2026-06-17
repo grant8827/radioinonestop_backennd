@@ -1159,6 +1159,7 @@ var (
 
 	webListenerSessions   = map[string]*webListenerSession{}
 	webListenerSessionsMu sync.Mutex
+	icecastAnalyticsAuthFailed atomic.Bool
 )
 
 func startAnalyticsWorker() {
@@ -1191,7 +1192,13 @@ func startAnalyticsWorker() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			pollAllMounts(client, icecastBase, icecastUser, icecastPass)
+			if icecastAnalyticsAuthFailed.Load() {
+				return
+			}
+			if !pollAllMounts(client, icecastBase, icecastUser, icecastPass) {
+				icecastAnalyticsAuthFailed.Store(true)
+				return
+			}
 		}
 	}()
 	log.Printf("[analytics] Icecast poller started → %s", icecastBase)
@@ -1200,12 +1207,12 @@ func startAnalyticsWorker() {
 // pollAllMounts fetches live mounts from the DB and polls each one.
 // We poll all stations (not just is_live=true) so a stale flag doesn't
 // cause listener counts to silently stay at 0.
-func pollAllMounts(client *http.Client, base, user, pass string) {
+func pollAllMounts(client *http.Client, base, user, pass string) bool {
 	rows, err := db.Query(`SELECT u.id, u.stream_key FROM users u
 		JOIN stations s ON s.user_id = u.id WHERE u.stream_key IS NOT NULL AND u.stream_key <> ''`)
 	if err != nil {
 		log.Printf("[analytics] pollAllMounts DB error: %v", err)
-		return
+		return true
 	}
 	defer rows.Close()
 
@@ -1233,45 +1240,52 @@ func pollAllMounts(client *http.Client, base, user, pass string) {
 	activeSessionsMu.Unlock()
 
 	for _, mu := range live {
-		pollMount(client, base, user, pass, mu.userID, mu.streamKey)
+		if !pollMount(client, base, user, pass, mu.userID, mu.streamKey) {
+			return false
+		}
 	}
+	return true
 }
 
-func pollMount(client *http.Client, base, user, pass, userID, streamKey string) {
+func pollMount(client *http.Client, base, user, pass, userID, streamKey string) bool {
 	mount := "/" + streamKey
 	reqURL := base + "/admin/listclients?mount=" + url.QueryEscape(mount)
 	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
 		log.Printf("[analytics] pollMount build request error: %v", err)
-		return
+		return true
 	}
 	req.SetBasicAuth(user, pass)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[analytics] pollMount GET %s error: %v", reqURL, err)
-		return
+		return true
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		log.Printf("[analytics] Icecast poller disabled: admin credentials rejected with status %d", resp.StatusCode)
+		return false
+	}
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[analytics] pollMount GET %s status %d", reqURL, resp.StatusCode)
 		activeSessionsMu.Lock()
 		closeAllSessions(userID)
 		activeSessionsMu.Unlock()
 		syncLiveListenerCount(userID)
-		return
+		return true
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("[analytics] pollMount read body error: %v", err)
-		return
+		return true
 	}
 
 	var stats icecastXML
 	if err := xml.Unmarshal(body, &stats); err != nil {
 		log.Printf("[analytics] pollMount XML parse error: %v — body: %s", err, string(body))
-		return
+		return true
 	}
 	log.Printf("[analytics] mount=%s sources=%d", mount, len(stats.Sources))
 
@@ -1314,6 +1328,7 @@ func pollMount(client *http.Client, base, user, pass, userID, streamKey string) 
 				    unique_ips     = GREATEST(listener_hourly.unique_ips, EXCLUDED.unique_ips)
 		`, userID, hourBucket, concurrent)
 	}
+	return true
 }
 
 func upsertSession(userID, mount, ipHash, countryCode, countryName string, connSecs int) {
@@ -3465,8 +3480,9 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	// ICECAST_HOST / ICECAST_PORT env vars let the server admin pin the
 	// Icecast endpoint (e.g. Railway private networking) regardless of what
 	// the browser sends.  When unset the client-supplied values are used.
-	if h := strings.TrimSpace(os.Getenv("ICECAST_HOST")); h != "" {
-		cfg.Host = h
+	icecastHostOverride := strings.TrimSpace(os.Getenv("ICECAST_HOST"))
+	if icecastHostOverride != "" {
+		cfg.Host = icecastHostOverride
 	}
 	if p := strings.TrimSpace(os.Getenv("ICECAST_PORT")); p != "" {
 		cfg.Port = p
@@ -3484,6 +3500,10 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	icecastPass := cfg.Password
 	if envPass := os.Getenv("ICECAST_SOURCE_PASSWORD"); envPass != "" {
 		icecastPass = envPass
+	}
+	if icecastHostOverride != "" && strings.TrimSpace(os.Getenv("ICECAST_SOURCE_PASSWORD")) == "" {
+		sendStatus("error", "ICECAST_SOURCE_PASSWORD is not set on backend; set the same value on backend and Icecast services, or use Hub mode")
+		return
 	}
 
 	// ── Build icecast:// URL using net/url (safe, no shell injection) ──────
