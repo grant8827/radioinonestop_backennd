@@ -151,8 +151,9 @@ func (sm *streamManager) transcode(ctx context.Context, key, outDir string, rtmp
 	playlist := filepath.Join(outDir, "index.m3u8")
 	segPattern := filepath.Join(outDir, "seg%05d.mp4")
 
-	// Decide whether this is audio-only (stream key contains "radio")
-	isRadio := strings.Contains(strings.ToLower(key), "radio")
+	// VIDEO DISABLED: all accepted RTMP input is audio-only. This preserves
+	// personal and shared radio keys while dropping any incoming video track.
+	isRadio := true
 
 	var args []string
 	if isRadio {
@@ -525,6 +526,41 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS schedules (
+			id           TEXT PRIMARY KEY,
+			user_id      TEXT NOT NULL,
+			song_id      TEXT NOT NULL,
+			title        TEXT NOT NULL,
+			artist       TEXT NOT NULL DEFAULT '',
+			source_type  TEXT NOT NULL DEFAULT 'library',
+			source_url   TEXT NOT NULL DEFAULT '',
+			playlist     JSONB NOT NULL DEFAULT '[]'::jsonb,
+			trigger_time TIMESTAMPTZ NOT NULL,
+			enabled      BOOLEAN NOT NULL DEFAULT true,
+			recurring    TEXT NOT NULL DEFAULT 'none',
+			triggered    BOOLEAN NOT NULL DEFAULT false,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			CHECK (recurring IN ('none', 'daily', 'weekly', 'monthly', 'yearly')),
+			CHECK (source_type IN ('library', 'url', 'playlist'))
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	_, _ = db.Exec(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'library'`)
+	_, _ = db.Exec(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS playlist JSONB NOT NULL DEFAULT '[]'::jsonb`)
+	_, _ = db.Exec(`ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_recurring_check`)
+	_, _ = db.Exec(`ALTER TABLE schedules ADD CONSTRAINT schedules_recurring_check CHECK (recurring IN ('none', 'daily', 'weekly', 'monthly', 'yearly'))`)
+	_, _ = db.Exec(`ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_source_type_check`)
+	_, _ = db.Exec(`ALTER TABLE schedules ADD CONSTRAINT schedules_source_type_check CHECK (source_type IN ('library', 'url', 'playlist'))`)
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, triggered, trigger_time)`)
+	if err != nil {
+		return err
+	}
 	// Listener analytics tables.
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS listener_sessions (
@@ -668,21 +704,21 @@ func initDB(dsn string) error {
 				)),
 				('professional', 'Professional', jsonb_build_array(
 					'Everything in Starter',
-					'Conference call rooms',
-					'Screen sharing',
-					'Up to 10 participants per call',
+					'Conference live-chat rooms',
+					'Up to 10 participants',
+					'Priority audio processing',
 					'Up to 1000 concurrent listeners'
 				)),
 				('enterprise', 'Enterprise', jsonb_build_array(
 					'Everything in Professional',
-					'Video live streaming',
-					'Multistream up to 3 channels',
-					'Social media live streaming',
+					'Higher bitrate radio streaming',
+					'Advanced listener reporting',
+					'Priority station support',
 					'Up to 2000 concurrent listeners'
 				)),
 				('ultimate', 'Ultimate', jsonb_build_array(
 					'Everything in Enterprise',
-					'Multistream up to 6 channels',
+					'Premium radio automation',
 					'Advanced analytics dashboard',
 					'Custom branding options',
 					'Unlimited concurrent listeners'
@@ -1157,8 +1193,8 @@ var (
 	activeSessions   = map[string]map[string]*activeSession{}
 	activeSessionsMu sync.Mutex
 
-	webListenerSessions   = map[string]*webListenerSession{}
-	webListenerSessionsMu sync.Mutex
+	webListenerSessions        = map[string]*webListenerSession{}
+	webListenerSessionsMu      sync.Mutex
 	icecastAnalyticsAuthFailed atomic.Bool
 	icecastAnalyticsPollCount  atomic.Uint64
 )
@@ -2797,8 +2833,7 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleConfig returns/updates station metadata.
-// It also computes the HLS URLs for radio and video streams dynamically
-// so the frontend always gets real, working playlist URLs.
+// It computes the radio HLS URL dynamically.
 func handleConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
@@ -2813,7 +2848,7 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 			"stationName": name,
 			"hlsBaseURL":  base,
 			"radioUrl":    base + "/hls/radio/index.m3u8",
-			"videoUrl":    base + "/hls/video/index.m3u8",
+			// VIDEO DISABLED: videoUrl intentionally omitted.
 		})
 
 	case http.MethodPost:
@@ -6837,6 +6872,433 @@ func updateAdminMarketing(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ─── Song scheduler ───────────────────────────────────────────────────────────
+
+type Schedule struct {
+	ID          string          `json:"id"`
+	SongID      string          `json:"song_id"`
+	Title       string          `json:"title"`
+	Artist      string          `json:"artist"`
+	SourceType  string          `json:"source_type"`
+	SourceURL   string          `json:"source_url"`
+	Playlist    []ScheduleTrack `json:"playlist"`
+	TriggerTime time.Time       `json:"trigger_time"`
+	Enabled     bool            `json:"enabled"`
+	Recurring   string          `json:"recurring"`
+	Triggered   bool            `json:"triggered"`
+}
+
+type ScheduleTrack struct {
+	SongID string `json:"song_id"`
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+}
+
+type scheduleEvent struct {
+	Type     string   `json:"type"`
+	Schedule Schedule `json:"schedule"`
+}
+
+type scheduleSSEBroker struct {
+	mu      sync.RWMutex
+	clients map[string]map[chan []byte]struct{}
+}
+
+var schedulerEvents = &scheduleSSEBroker{clients: make(map[string]map[chan []byte]struct{})}
+
+func (b *scheduleSSEBroker) register(userID string) chan []byte {
+	ch := make(chan []byte, 8)
+	b.mu.Lock()
+	if b.clients[userID] == nil {
+		b.clients[userID] = make(map[chan []byte]struct{})
+	}
+	b.clients[userID][ch] = struct{}{}
+	b.mu.Unlock()
+	return ch
+}
+
+func (b *scheduleSSEBroker) unregister(userID string, ch chan []byte) {
+	b.mu.Lock()
+	if clients := b.clients[userID]; clients != nil {
+		delete(clients, ch)
+		if len(clients) == 0 {
+			delete(b.clients, userID)
+		}
+	}
+	b.mu.Unlock()
+}
+
+func (b *scheduleSSEBroker) broadcast(userID string, event scheduleEvent) {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for ch := range b.clients[userID] {
+		select {
+		case ch <- payload:
+		default:
+			log.Printf("[scheduler] dropping event for slow SSE client user=%s", userID)
+		}
+	}
+}
+
+func scanSchedule(scanner interface{ Scan(...interface{}) error }) (Schedule, error) {
+	var s Schedule
+	var playlistJSON []byte
+	err := scanner.Scan(&s.ID, &s.SongID, &s.Title, &s.Artist, &s.SourceType, &s.SourceURL, &playlistJSON, &s.TriggerTime, &s.Enabled, &s.Recurring, &s.Triggered)
+	if err == nil && len(playlistJSON) > 0 {
+		_ = json.Unmarshal(playlistJSON, &s.Playlist)
+	}
+	return s, err
+}
+
+const scheduleColumns = `id, song_id, title, artist, source_type, source_url, playlist, trigger_time, enabled, recurring, triggered`
+
+func validRecurrence(value string) bool {
+	return value == "none" || value == "daily" || value == "weekly" || value == "monthly" || value == "yearly"
+}
+
+func validScheduleSource(value string) bool {
+	return value == "library" || value == "url" || value == "playlist"
+}
+
+func nextScheduleTime(trigger time.Time, recurring string) time.Time {
+	switch recurring {
+	case "daily":
+		return trigger.Add(24 * time.Hour)
+	case "weekly":
+		return trigger.Add(7 * 24 * time.Hour)
+	case "monthly":
+		return trigger.AddDate(0, 1, 0)
+	case "yearly":
+		return trigger.AddDate(1, 0, 0)
+	default:
+		return trigger
+	}
+}
+
+func triggerSchedule(userID, scheduleID string, manual bool) (Schedule, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return Schedule{}, err
+	}
+	defer tx.Rollback()
+
+	query := `SELECT ` + scheduleColumns + ` FROM schedules WHERE id = $1 AND user_id = $2 FOR UPDATE`
+	s, err := scanSchedule(tx.QueryRow(query, scheduleID, userID))
+	if err != nil {
+		return Schedule{}, err
+	}
+	if !manual && (!s.Enabled || s.Triggered) {
+		return Schedule{}, sql.ErrNoRows
+	}
+
+	if manual {
+		// Manual trigger plays now without changing the programmed recurrence.
+	} else if s.Recurring == "none" {
+		s.Triggered = true
+		_, err = tx.Exec(`UPDATE schedules SET triggered = true, updated_at = NOW() WHERE id = $1`, s.ID)
+	} else {
+		s.TriggerTime = nextScheduleTime(s.TriggerTime, s.Recurring)
+		s.Triggered = false
+		_, err = tx.Exec(`UPDATE schedules SET trigger_time = $1, triggered = false, updated_at = NOW() WHERE id = $2`, s.TriggerTime, s.ID)
+	}
+	if err != nil {
+		return Schedule{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return Schedule{}, err
+	}
+	schedulerEvents.broadcast(userID, scheduleEvent{Type: "trigger", Schedule: s})
+	log.Printf("[scheduler] triggered user=%s schedule=%s song=%q manual=%v", userID, s.ID, s.Title, manual)
+	return s, nil
+}
+
+func runSchedulerLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		rows, err := db.Query(`
+			SELECT id, user_id
+			FROM schedules
+			WHERE enabled = true
+			  AND triggered = false
+			  AND trigger_time <= $1
+			  AND trigger_time >= $2
+			ORDER BY trigger_time
+		`, now.UTC(), now.UTC().Add(-time.Minute))
+		if err != nil {
+			log.Printf("[scheduler] due query error: %v", err)
+			continue
+		}
+		var due [][2]string
+		for rows.Next() {
+			var id, userID string
+			if rows.Scan(&id, &userID) == nil {
+				due = append(due, [2]string{id, userID})
+			}
+		}
+		rows.Close()
+		for _, item := range due {
+			if _, err := triggerSchedule(item[1], item[0], false); err != nil && err != sql.ErrNoRows {
+				log.Printf("[scheduler] trigger error schedule=%s: %v", item[0], err)
+			}
+		}
+	}
+}
+
+func handleSchedules(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(contextKeyUserID).(string)
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		rows, err := db.Query(`SELECT `+scheduleColumns+` FROM schedules WHERE user_id = $1 ORDER BY trigger_time`, userID)
+		if err != nil {
+			http.Error(w, "failed to load schedules", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		schedules := make([]Schedule, 0)
+		for rows.Next() {
+			s, scanErr := scanSchedule(rows)
+			if scanErr == nil {
+				schedules = append(schedules, s)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"schedules": schedules})
+
+	case http.MethodPost:
+		var body Schedule
+		if json.NewDecoder(r.Body).Decode(&body) != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		body.SongID = strings.TrimSpace(body.SongID)
+		body.Title = strings.TrimSpace(body.Title)
+		body.Artist = strings.TrimSpace(body.Artist)
+		body.SourceType = strings.ToLower(strings.TrimSpace(body.SourceType))
+		body.SourceURL = strings.TrimSpace(body.SourceURL)
+		body.Recurring = strings.ToLower(strings.TrimSpace(body.Recurring))
+		if body.SourceType == "" {
+			body.SourceType = "library"
+		}
+		if body.SongID == "" || body.Title == "" || body.TriggerTime.IsZero() || !validRecurrence(body.Recurring) || !validScheduleSource(body.SourceType) {
+			http.Error(w, "song_id, title, trigger_time, recurring, and source_type are required", http.StatusBadRequest)
+			return
+		}
+		if body.SourceType == "url" && body.SourceURL == "" {
+			http.Error(w, "source_url is required for URL schedules", http.StatusBadRequest)
+			return
+		}
+		if body.SourceType == "playlist" && len(body.Playlist) == 0 {
+			http.Error(w, "playlist tracks are required", http.StatusBadRequest)
+			return
+		}
+		playlistJSON, _ := json.Marshal(body.Playlist)
+		id, _ := generateKey()
+		body.ID = id
+		body.Enabled = true
+		body.Triggered = false
+		_, err := db.Exec(`
+			INSERT INTO schedules (id, user_id, song_id, title, artist, source_type, source_url, playlist, trigger_time, enabled, recurring, triggered)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false)
+		`, body.ID, userID, body.SongID, body.Title, body.Artist, body.SourceType, body.SourceURL, playlistJSON, body.TriggerTime.UTC(), body.Enabled, body.Recurring)
+		if err != nil {
+			http.Error(w, "failed to create schedule", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(body)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleScheduleByID(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(contextKeyUserID).(string)
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/schedules/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "schedule id is required", http.StatusBadRequest)
+		return
+	}
+	id := parts[0]
+	w.Header().Set("Content-Type", "application/json")
+
+	if len(parts) == 2 && parts[1] == "trigger" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s, err := triggerSchedule(userID, id, true)
+		if err == sql.ErrNoRows {
+			http.Error(w, "schedule not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, "failed to trigger schedule", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(s)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut:
+		var body Schedule
+		if json.NewDecoder(r.Body).Decode(&body) != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		body.SongID = strings.TrimSpace(body.SongID)
+		body.Title = strings.TrimSpace(body.Title)
+		body.Artist = strings.TrimSpace(body.Artist)
+		body.SourceType = strings.ToLower(strings.TrimSpace(body.SourceType))
+		body.SourceURL = strings.TrimSpace(body.SourceURL)
+		body.Recurring = strings.ToLower(strings.TrimSpace(body.Recurring))
+		if body.SourceType == "" {
+			body.SourceType = "library"
+		}
+		if body.SongID == "" || body.Title == "" || body.TriggerTime.IsZero() || !validRecurrence(body.Recurring) || !validScheduleSource(body.SourceType) || (body.SourceType == "url" && body.SourceURL == "") {
+			http.Error(w, "invalid schedule", http.StatusBadRequest)
+			return
+		}
+		if body.SourceType == "playlist" && len(body.Playlist) == 0 {
+			http.Error(w, "playlist tracks are required", http.StatusBadRequest)
+			return
+		}
+		playlistJSON, _ := json.Marshal(body.Playlist)
+		res, err := db.Exec(`
+			UPDATE schedules
+			SET song_id=$1, title=$2, artist=$3, source_type=$4, source_url=$5,
+			    playlist=$6, trigger_time=$7, enabled=$8, recurring=$9, triggered=false, updated_at=NOW()
+			WHERE id=$10 AND user_id=$11
+		`, body.SongID, body.Title, body.Artist, body.SourceType, body.SourceURL, playlistJSON, body.TriggerTime.UTC(), body.Enabled, body.Recurring, id, userID)
+		if err != nil {
+			http.Error(w, "failed to update schedule", http.StatusInternalServerError)
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			http.Error(w, "schedule not found", http.StatusNotFound)
+			return
+		}
+		body.ID = id
+		body.Triggered = false
+		json.NewEncoder(w).Encode(body)
+	case http.MethodDelete:
+		res, err := db.Exec(`DELETE FROM schedules WHERE id=$1 AND user_id=$2`, id, userID)
+		if err != nil {
+			http.Error(w, "failed to delete schedule", http.StatusInternalServerError)
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			http.Error(w, "schedule not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleScheduleEvents(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(r.URL.Query().Get("token"))
+	claims, err := jwtVerify(token)
+	if err != nil || claims.UserID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ch := schedulerEvents.register(claims.UserID)
+	defer schedulerEvents.unregister(claims.UserID, ch)
+	fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+	for {
+		select {
+		case payload := <-ch:
+			fmt.Fprintf(w, "data: %s\n\n", payload)
+			flusher.Flush()
+		case <-keepalive.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func handleSchedulerURLStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rawURL := strings.TrimSpace(r.URL.Query().Get("url"))
+	if rawURL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		http.Error(w, "invalid url", http.StatusBadRequest)
+		return
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		http.Error(w, "url must use http or https", http.StatusBadRequest)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, parsed.String(), nil)
+	if err != nil {
+		http.Error(w, "failed to create upstream request", http.StatusBadRequest)
+		return
+	}
+	if rangeHeader := strings.TrimSpace(r.Header.Get("Range")); rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+	req.Header.Set("Accept", "audio/*,*/*;q=0.8")
+	if ua := strings.TrimSpace(r.Header.Get("User-Agent")); ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, "failed to fetch source audio", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for _, header := range []string{"Content-Type", "Content-Length", "Accept-Ranges", "Content-Range", "Cache-Control", "ETag", "Last-Modified"} {
+		if value := resp.Header.Get(header); value != "" {
+			w.Header().Set(header, value)
+		}
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(resp.StatusCode)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("[scheduler] url stream proxy copy error: %v", err)
+	}
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 func main() {
@@ -6901,6 +7363,7 @@ func main() {
 	startAnalyticsWorker()
 	startWebListenerCleanup()
 	startMetricsWorker()
+	go runSchedulerLoop()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -6927,20 +7390,20 @@ func main() {
 	mux.HandleFunc("/api/auth/login", handleLogin)
 	mux.HandleFunc("/api/auth/", handleOAuthRoute) // platform OAuth connect + callback
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
-	mux.HandleFunc("/api/destinations", requireAuth(handleDestinations))
-	mux.HandleFunc("/api/destinations/", requireAuth(handleDestinations))
+	mux.HandleFunc("/api/schedules", requireAuth(handleSchedules))
+	mux.HandleFunc("/api/schedules/", requireAuth(handleScheduleByID))
+	mux.HandleFunc("/api/scheduler/url-stream", requireAuth(handleSchedulerURLStream))
+	mux.HandleFunc("/api/events", handleScheduleEvents)
+	// VIDEO DISABLED: RTMP multistream destination routes are not registered.
 	mux.HandleFunc("/api/user/profile", requireAuth(handleUserProfile))
 	mux.HandleFunc("/api/user/listener-status", requireAuth(handleListenerStatus))
 	mux.HandleFunc("/api/user/upgrade", requireAuth(handleUpgradePlan))
 	mux.HandleFunc("/api/user/password", requireAuth(handleChangePassword))
 	mux.HandleFunc("/api/user/account", requireAuth(handleDeleteAccount))
-	mux.HandleFunc("/api/user/oauth-connections", requireAuth(handleOAuthConnections))
-	mux.HandleFunc("/api/user/oauth-connections/", requireAuth(handleOAuthConnections))
-	mux.HandleFunc("/api/user/oauth-stream-keys/sync", requireAuth(handleSyncOAuthStreamKeys))
+	// VIDEO DISABLED: social-video OAuth routes are not registered.
 	mux.HandleFunc("/api/stream/status", handleStreamLifecycleWebhook)
 	mux.HandleFunc("/api/stream/auth", handleStreamAuth)
-	mux.HandleFunc("/api/stream/relay/start", requireAuth(handleRelayStart))
-	mux.HandleFunc("/api/stream/relay/stop", requireAuth(handleRelayStop))
+	// VIDEO DISABLED: WebRTC-to-RTMP relay routes are not registered.
 	mux.HandleFunc("/api/metrics", requireAuth(handleMetrics))
 	mux.HandleFunc("/api/stations/", handleGetStation)
 	mux.HandleFunc("/api/icecast/auth", handleIcecastAuth)
