@@ -3006,6 +3006,29 @@ type encoderSessionStore struct {
 
 var liveEncoderSessions = &encoderSessionStore{live: make(map[string]bool)}
 
+type encoderOwnerStore struct {
+	mu     sync.Mutex
+	active map[string]bool
+}
+
+var icecastEncoderOwners = &encoderOwnerStore{active: make(map[string]bool)}
+
+func (s *encoderOwnerStore) acquire(userID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active[userID] {
+		return false
+	}
+	s.active[userID] = true
+	return true
+}
+
+func (s *encoderOwnerStore) release(userID string) {
+	s.mu.Lock()
+	delete(s.active, userID)
+	s.mu.Unlock()
+}
+
 func (s *encoderSessionStore) markLive(userID string) {
 	if userID == "" {
 		return
@@ -3557,6 +3580,12 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		handleBroadcast(conn, sendStatus, claims.UserID)
 		return
 	}
+	if !icecastEncoderOwners.acquire(claims.UserID) {
+		log.Printf("[encoder/%s] rejected duplicate Icecast encoder connection", claims.UserID)
+		sendStatus("error", "An Icecast encoder is already active in another tab or device")
+		return
+	}
+	defer icecastEncoderOwners.release(claims.UserID)
 
 	// ── Validate and sanitize inputs ───────────────────────────────────────
 	cfg.Host = strings.TrimSpace(cfg.Host)
@@ -3678,6 +3707,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	go func() { ffmpegDone <- cmd.Wait() }()
 
 	liveMarked := false
+	exitReason := "handler completed"
 	markLive := func() {
 		if liveMarked {
 			return
@@ -3687,9 +3717,10 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		icecastListenURL := "/icecast" + cfg.Mount
 		db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1, icecast_listen_url = $2 WHERE user_id = $3`, //nolint:errcheck
 			time.Now().UTC().Format(time.RFC3339), icecastListenURL, claims.UserID)
-		sendStatus("live", fmt.Sprintf("Streaming → %s:%s%s", cfg.Host, cfg.Port, cfg.Mount))
+		log.Printf("[encoder/%s] first audio received; station marked live", claims.UserID)
 	}
 	defer func() {
+		log.Printf("[encoder/%s] stopped: %s", claims.UserID, exitReason)
 		if liveMarked {
 			liveEncoderSessions.clear(claims.UserID)
 			db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, claims.UserID) //nolint:errcheck
@@ -3721,8 +3752,10 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		select {
 		case err := <-ffmpegDone:
 			if err != nil {
+				exitReason = ffmpegStatusMessage("FFmpeg exited", err, ffmpegStderr)
 				sendStatus("error", ffmpegStatusMessage("FFmpeg exited", err, ffmpegStderr))
 			} else {
+				exitReason = "FFmpeg process exited normally"
 				sendStatus("stopped", "FFmpeg process exited")
 			}
 			return
@@ -3733,15 +3766,23 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		mt, data, err := conn.ReadMessage()
 		conn.SetReadDeadline(time.Time{})
 		if err != nil {
+			if closeErr, ok := err.(*websocket.CloseError); ok {
+				exitReason = fmt.Sprintf("websocket closed code=%d text=%q", closeErr.Code, closeErr.Text)
+			} else {
+				exitReason = "websocket read error: " + err.Error()
+			}
 			cancel()
 			stdin.Close()
-			<-ffmpegDone
+			if ffErr := <-ffmpegDone; ffErr != nil {
+				exitReason += "; " + ffmpegStatusMessage("FFmpeg shutdown", ffErr, ffmpegStderr)
+			}
 			return
 		}
 
 		if mt == websocket.TextMessage {
 			var ctrl encoderConfig
 			if json.Unmarshal(data, &ctrl) == nil && ctrl.Action == "stop" {
+				exitReason = "client requested stop"
 				cancel()
 				stdin.Close()
 				<-ffmpegDone
@@ -3753,10 +3794,12 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 
 		// Binary audio chunk
 		if _, err := stdin.Write(data); err != nil {
+			exitReason = "FFmpeg stdin write failed: " + err.Error()
 			cancel()
 			stdin.Close() //nolint:errcheck
 			ffErr := <-ffmpegDone
 			if ffErr != nil || ffmpegStderr.String() != "" {
+				exitReason = ffmpegStatusMessage(exitReason, ffErr, ffmpegStderr)
 				sendStatus("error", ffmpegStatusMessage("FFmpeg stopped before accepting audio", ffErr, ffmpegStderr))
 			} else {
 				sendStatus("error", "write to ffmpeg: "+err.Error())
