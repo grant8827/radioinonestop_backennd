@@ -2999,6 +2999,40 @@ type encoderStatus struct {
 	Msg    string `json:"msg,omitempty"`
 }
 
+type encoderSessionStore struct {
+	mu   sync.RWMutex
+	live map[string]bool
+}
+
+var liveEncoderSessions = &encoderSessionStore{live: make(map[string]bool)}
+
+func (s *encoderSessionStore) markLive(userID string) {
+	if userID == "" {
+		return
+	}
+	s.mu.Lock()
+	s.live[userID] = true
+	s.mu.Unlock()
+}
+
+func (s *encoderSessionStore) clear(userID string) {
+	if userID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.live, userID)
+	s.mu.Unlock()
+}
+
+func (s *encoderSessionStore) isLive(userID string) bool {
+	if userID == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.live[userID]
+}
+
 type tailBuffer struct {
 	mu   sync.Mutex
 	data []byte
@@ -3039,6 +3073,16 @@ func ffmpegStatusMessage(prefix string, err error, stderr *tailBuffer) string {
 	return msg
 }
 
+func sanitizePublicStationLiveState(userID string, isLive bool, icecastListenURL string) (bool, string) {
+	if !isLive {
+		return false, ""
+	}
+	if icecastListenURL != "" && !liveEncoderSessions.isLive(userID) {
+		return false, ""
+	}
+	return isLive, icecastListenURL
+}
+
 // handleBroadcast is the hub-mode branch of the encoder WebSocket.
 // The browser sends raw WebM/Opus audio chunks which are:
 //  1. Fanned out via the stationHub to /listen/{slug} HTTP clients (WebM, desktop-only)
@@ -3058,6 +3102,7 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 			return
 		}
 		liveMarked = true
+		liveEncoderSessions.markLive(userID)
 		db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1, icecast_listen_url = '' WHERE user_id = $2`, //nolint:errcheck
 			time.Now().UTC().Format(time.RFC3339), userID)
 		log.Printf("[hub/%s] marked live after first audio chunk", stationSlug)
@@ -3126,6 +3171,7 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 
 		closeHub(stationSlug, h)
 		if liveMarked {
+			liveEncoderSessions.clear(userID)
 			db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, userID) //nolint:errcheck
 		}
 		log.Printf("[hub/%s] broadcaster disconnected", stationSlug)
@@ -3309,7 +3355,7 @@ func handleListenerSession(w http.ResponseWriter, r *http.Request) {
 // GET /api/stations
 func handleGetStations(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
+		SELECT user_id, station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
 		FROM stations
 		ORDER BY is_live DESC, station_name ASC
 	`)
@@ -3319,6 +3365,7 @@ func handleGetStations(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	type Station struct {
+		UserID           string `json:"-"`
 		Slug             string `json:"slug"`
 		Name             string `json:"name"`
 		LogoURL          string `json:"logo_url"`
@@ -3331,9 +3378,10 @@ func handleGetStations(w http.ResponseWriter, r *http.Request) {
 	stations := []Station{}
 	for rows.Next() {
 		var s Station
-		if err := rows.Scan(&s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc, &s.IcecastListenURL); err != nil {
+		if err := rows.Scan(&s.UserID, &s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc, &s.IcecastListenURL); err != nil {
 			continue
 		}
+		s.IsLive, s.IcecastListenURL = sanitizePublicStationLiveState(s.UserID, s.IsLive, s.IcecastListenURL)
 		stations = append(stations, s)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -3350,6 +3398,7 @@ func handleGetStation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type Station struct {
+		UserID           string `json:"-"`
 		Slug             string `json:"slug"`
 		Name             string `json:"name"`
 		LogoURL          string `json:"logo_url"`
@@ -3361,13 +3410,14 @@ func handleGetStation(w http.ResponseWriter, r *http.Request) {
 	}
 	var s Station
 	err := db.QueryRow(`
-		SELECT station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
+		SELECT user_id, station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
 		FROM stations WHERE station_slug = $1
-	`, slug).Scan(&s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc, &s.IcecastListenURL)
+	`, slug).Scan(&s.UserID, &s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc, &s.IcecastListenURL)
 	if err != nil {
 		http.Error(w, `{"error":"station not found"}`, http.StatusNotFound)
 		return
 	}
+	s.IsLive, s.IcecastListenURL = sanitizePublicStationLiveState(s.UserID, s.IsLive, s.IcecastListenURL)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(s)
 }
@@ -3633,6 +3683,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		liveMarked = true
+		liveEncoderSessions.markLive(claims.UserID)
 		icecastListenURL := "/icecast" + cfg.Mount
 		db.Exec(`UPDATE stations SET is_live = true, last_connected_at = $1, icecast_listen_url = $2 WHERE user_id = $3`, //nolint:errcheck
 			time.Now().UTC().Format(time.RFC3339), icecastListenURL, claims.UserID)
@@ -3640,6 +3691,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() {
 		if liveMarked {
+			liveEncoderSessions.clear(claims.UserID)
 			db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, claims.UserID) //nolint:errcheck
 		}
 	}()
