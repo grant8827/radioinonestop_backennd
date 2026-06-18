@@ -1936,7 +1936,9 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	if stationSlug != "" {
 		resp["station_slug"] = stationSlug
 		resp["listen_url"] = "/listen/" + stationSlug
+		resp["hub_listen_url"] = "/listen/" + stationSlug
 	}
+	resp["icecast_listen_url"] = "/icecast/" + streamKey
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -2412,7 +2414,9 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 	if stationSlug != "" {
 		resp["station_slug"] = stationSlug
 		resp["listen_url"] = "/listen/" + stationSlug
+		resp["hub_listen_url"] = "/listen/" + stationSlug
 	}
+	resp["icecast_listen_url"] = "/icecast/" + streamKey
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
