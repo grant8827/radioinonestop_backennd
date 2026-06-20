@@ -553,6 +553,7 @@ func initDB(dsn string) error {
 	_, _ = db.Exec(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'library'`)
 	_, _ = db.Exec(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS playlist JSONB NOT NULL DEFAULT '[]'::jsonb`)
+	_, _ = db.Exec(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_recurring_check`)
 	_, _ = db.Exec(`ALTER TABLE schedules ADD CONSTRAINT schedules_recurring_check CHECK (recurring IN ('none', 'daily', 'weekly', 'monthly', 'yearly'))`)
 	_, _ = db.Exec(`ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_source_type_check`)
@@ -6986,6 +6987,7 @@ func updateAdminMarketing(w http.ResponseWriter, r *http.Request) {
 
 type Schedule struct {
 	ID          string          `json:"id"`
+	Name        string          `json:"name"`
 	SongID      string          `json:"song_id"`
 	Title       string          `json:"title"`
 	Artist      string          `json:"artist"`
@@ -7057,14 +7059,14 @@ func (b *scheduleSSEBroker) broadcast(userID string, event scheduleEvent) {
 func scanSchedule(scanner interface{ Scan(...interface{}) error }) (Schedule, error) {
 	var s Schedule
 	var playlistJSON []byte
-	err := scanner.Scan(&s.ID, &s.SongID, &s.Title, &s.Artist, &s.SourceType, &s.SourceURL, &playlistJSON, &s.TriggerTime, &s.Enabled, &s.Recurring, &s.Triggered)
+	err := scanner.Scan(&s.ID, &s.Name, &s.SongID, &s.Title, &s.Artist, &s.SourceType, &s.SourceURL, &playlistJSON, &s.TriggerTime, &s.Enabled, &s.Recurring, &s.Triggered)
 	if err == nil && len(playlistJSON) > 0 {
 		_ = json.Unmarshal(playlistJSON, &s.Playlist)
 	}
 	return s, err
 }
 
-const scheduleColumns = `id, song_id, title, artist, source_type, source_url, playlist, trigger_time, enabled, recurring, triggered`
+const scheduleColumns = `id, name, song_id, title, artist, source_type, source_url, playlist, trigger_time, enabled, recurring, triggered`
 
 func validRecurrence(value string) bool {
 	return value == "none" || value == "daily" || value == "weekly" || value == "monthly" || value == "yearly"
@@ -7186,6 +7188,7 @@ func handleSchedules(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
+		body.Name = strings.TrimSpace(body.Name)
 		body.SongID = strings.TrimSpace(body.SongID)
 		body.Title = strings.TrimSpace(body.Title)
 		body.Artist = strings.TrimSpace(body.Artist)
@@ -7213,9 +7216,9 @@ func handleSchedules(w http.ResponseWriter, r *http.Request) {
 		body.Enabled = true
 		body.Triggered = false
 		_, err := db.Exec(`
-			INSERT INTO schedules (id, user_id, song_id, title, artist, source_type, source_url, playlist, trigger_time, enabled, recurring, triggered)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false)
-		`, body.ID, userID, body.SongID, body.Title, body.Artist, body.SourceType, body.SourceURL, playlistJSON, body.TriggerTime.UTC(), body.Enabled, body.Recurring)
+			INSERT INTO schedules (id, user_id, name, song_id, title, artist, source_type, source_url, playlist, trigger_time, enabled, recurring, triggered)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)
+		`, body.ID, userID, body.Name, body.SongID, body.Title, body.Artist, body.SourceType, body.SourceURL, playlistJSON, body.TriggerTime.UTC(), body.Enabled, body.Recurring)
 		if err != nil {
 			http.Error(w, "failed to create schedule", http.StatusInternalServerError)
 			return
@@ -7263,6 +7266,7 @@ func handleScheduleByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
+		body.Name = strings.TrimSpace(body.Name)
 		body.SongID = strings.TrimSpace(body.SongID)
 		body.Title = strings.TrimSpace(body.Title)
 		body.Artist = strings.TrimSpace(body.Artist)
@@ -7283,10 +7287,10 @@ func handleScheduleByID(w http.ResponseWriter, r *http.Request) {
 		playlistJSON, _ := json.Marshal(body.Playlist)
 		res, err := db.Exec(`
 			UPDATE schedules
-			SET song_id=$1, title=$2, artist=$3, source_type=$4, source_url=$5,
-			    playlist=$6, trigger_time=$7, enabled=$8, recurring=$9, triggered=false, updated_at=NOW()
-			WHERE id=$10 AND user_id=$11
-		`, body.SongID, body.Title, body.Artist, body.SourceType, body.SourceURL, playlistJSON, body.TriggerTime.UTC(), body.Enabled, body.Recurring, id, userID)
+			SET name=$1, song_id=$2, title=$3, artist=$4, source_type=$5, source_url=$6,
+			    playlist=$7, trigger_time=$8, enabled=$9, recurring=$10, triggered=false, updated_at=NOW()
+			WHERE id=$11 AND user_id=$12
+		`, body.Name, body.SongID, body.Title, body.Artist, body.SourceType, body.SourceURL, playlistJSON, body.TriggerTime.UTC(), body.Enabled, body.Recurring, id, userID)
 		if err != nil {
 			http.Error(w, "failed to update schedule", http.StatusInternalServerError)
 			return
@@ -7353,6 +7357,19 @@ func handleScheduleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSchedulerURLStream(w http.ResponseWriter, r *http.Request) {
+	// The <audio> element src cannot send Authorization headers, so accept the
+	// JWT as a ?token= query param (same pattern as /api/events).
+	tokenStr := strings.TrimSpace(r.URL.Query().Get("token"))
+	if tokenStr == "" {
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			tokenStr = strings.TrimPrefix(auth, "Bearer ")
+		}
+	}
+	if _, err := jwtVerify(tokenStr); err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -7502,7 +7519,7 @@ func main() {
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
 	mux.HandleFunc("/api/schedules", requireAuth(handleSchedules))
 	mux.HandleFunc("/api/schedules/", requireAuth(handleScheduleByID))
-	mux.HandleFunc("/api/scheduler/url-stream", requireAuth(handleSchedulerURLStream))
+	mux.HandleFunc("/api/scheduler/url-stream", handleSchedulerURLStream)
 	mux.HandleFunc("/api/events", handleScheduleEvents)
 	// VIDEO DISABLED: RTMP multistream destination routes are not registered.
 	mux.HandleFunc("/api/user/profile", requireAuth(handleUserProfile))
