@@ -626,6 +626,8 @@ func initDB(dsn string) error {
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_email_verified BOOLEAN NOT NULL DEFAULT false`,
+		// Mark pre-existing accounts (no OTP code = registered before email verification was added) as verified
+		`UPDATE users SET is_email_verified = true WHERE otp_code = '' AND is_email_verified = false`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires_at TEXT NOT NULL DEFAULT ''`,
 	} {
@@ -2150,17 +2152,21 @@ func handleForgotPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+	log.Printf("[forgot-password] request for %s", body.Email)
 	// Always return 200 — don't leak whether the email exists
 	w.WriteHeader(http.StatusOK)
 
 	var userID, firstName string
-	err := db.QueryRow(`SELECT id, first_name FROM users WHERE email = $1 AND is_email_verified = true`, body.Email).
+	err := db.QueryRow(`SELECT id, first_name FROM users WHERE email = $1`, body.Email).
 		Scan(&userID, &firstName)
 	if err != nil {
+		log.Printf("[forgot-password] user not found for %s: %v", body.Email, err)
 		return
 	}
+	log.Printf("[forgot-password] found user %s (%s), generating token", userID, body.Email)
 	tokenBytes := make([]byte, 32)
 	if _, err = rand.Read(tokenBytes); err != nil {
+		log.Printf("[forgot-password] rand error: %v", err)
 		return
 	}
 	resetToken := hex.EncodeToString(tokenBytes)
@@ -2171,9 +2177,12 @@ func handleForgotPassword(w http.ResponseWriter, r *http.Request) {
 		baseURL = "https://radioinonestop.com"
 	}
 	resetLink := baseURL + "/reset-password?token=" + resetToken
+	log.Printf("[forgot-password] sending reset email to %s link=%s", body.Email, resetLink)
 	go func() {
 		if err := sendPasswordResetEmail(body.Email, firstName, resetLink); err != nil {
-			log.Printf("[email] reset password to %s: %v", body.Email, err)
+			log.Printf("[forgot-password] SMTP error for %s: %v", body.Email, err)
+		} else {
+			log.Printf("[forgot-password] email sent OK to %s", body.Email)
 		}
 	}()
 }

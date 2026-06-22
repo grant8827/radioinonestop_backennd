@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net/smtp"
 	"os"
 	"time"
@@ -11,7 +12,7 @@ import (
 const (
 	mailtrapHost  = "live.smtp.mailtrap.io"
 	mailtrapPort  = "587"
-	mailtrapUser  = "apismtp@mailtrap.io"
+	mailtrapUser  = "api"
 	emailFromAddr = "noreply@radioinonestop.com"
 	emailFromName = "Radio In One Stop"
 )
@@ -19,8 +20,9 @@ const (
 func sendMail(to, subject, htmlBody string) error {
 	token := os.Getenv("MAILTRAP_API_TOKEN")
 	if token == "" {
-		return fmt.Errorf("MAILTRAP_API_TOKEN not set")
+		return fmt.Errorf("MAILTRAP_API_TOKEN env var not set")
 	}
+	log.Printf("[email] dialing %s:%s to send to %s", mailtrapHost, mailtrapPort, to)
 	client, err := smtp.Dial(mailtrapHost + ":" + mailtrapPort)
 	if err != nil {
 		return fmt.Errorf("smtp dial: %w", err)
