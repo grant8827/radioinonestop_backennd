@@ -623,6 +623,11 @@ func initDB(dsn string) error {
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS paypal_subscription_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_email_verified BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires_at TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err = db.Exec(migration); err != nil {
 			return err
@@ -1840,6 +1845,15 @@ func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // handleRegister creates a new user with an auto-generated stream key.
+func generateOTP() (string, error) {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	n := (uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])) % 1000000
+	return fmt.Sprintf("%06d", n), nil
+}
+
 // POST /api/auth/register  {"email":"...","password":"...","first_name":"...","last_name":"...","station_name":"...","logo_url":"...","genre":"...","description":"..."}
 func handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1891,6 +1905,34 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
+	// Check if email already exists
+	var existingID string
+	var existingVerified bool
+	_ = db.QueryRow(`SELECT id, is_email_verified FROM users WHERE email = $1`, body.Email).
+		Scan(&existingID, &existingVerified)
+	if existingID != "" {
+		if existingVerified {
+			http.Error(w, "email already registered", http.StatusConflict)
+			return
+		}
+		// Unverified account — regenerate OTP and resend
+		otp, err := generateOTP()
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		exp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
+		_, _ = db.Exec(`UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`, otp, exp, existingID)
+		go func() {
+			if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
+				log.Printf("[email] resend OTP to %s: %v", body.Email, err)
+			}
+		}()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "verify_email", "email": body.Email})
+		return
+	}
+
 	userID, err := generateKey()
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
@@ -1901,47 +1943,33 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
+	otp, err := generateOTP()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	otpExp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
 	_, err = db.Exec(
-		`INSERT INTO users (id, email, password_hash, stream_key, first_name, last_name, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		userID, body.Email, string(hash), streamKey, body.FirstName, body.LastName, time.Now().UTC().Format(time.RFC3339),
+		`INSERT INTO users (id, email, password_hash, stream_key, first_name, last_name, created_at, otp_code, otp_expires_at, is_email_verified) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
+		userID, body.Email, string(hash), streamKey, body.FirstName, body.LastName, time.Now().UTC().Format(time.RFC3339), otp, otpExp,
 	)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-			http.Error(w, "email already registered", http.StatusConflict)
-			return
-		}
 		log.Printf("[auth] register error: %v", err)
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	token, err := jwtSign(userID, body.Email, body.StationName, "user")
-	if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
-	stationSlug, _ := ensureStation(userID, body.Email, body.StationName, body.LogoURL)
-	// New accounts stay inactive until payment is completed or an admin activates them.
+	ensureStation(userID, body.Email, body.StationName, body.LogoURL)
 	_, _ = db.Exec(`UPDATE stations SET is_suspended = true WHERE user_id = $1`, userID)
-	// Store genre and description if station was created
-	if stationSlug != "" && (body.Genre != "" || body.Description != "") {
-		_, _ = db.Exec(
-			`UPDATE stations SET genre = $1, description = $2 WHERE user_id = $3`,
-			body.Genre, body.Description, userID,
-		)
+	if body.Genre != "" || body.Description != "" {
+		_, _ = db.Exec(`UPDATE stations SET genre = $1, description = $2 WHERE user_id = $3`, body.Genre, body.Description, userID)
 	}
-	resp := map[string]string{
-		"token":      token,
-		"stream_key": streamKey,
-		"rtmp_url":   rtmpIngestBase + "/" + streamKey,
-	}
-	if stationSlug != "" {
-		resp["station_slug"] = stationSlug
-		resp["listen_url"] = "/listen/" + stationSlug
-		resp["hub_listen_url"] = "/listen/" + stationSlug
-	}
-	resp["icecast_listen_url"] = "/icecast/" + streamKey
+	go func() {
+		if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
+			log.Printf("[email] send OTP to %s: %v", body.Email, err)
+		}
+	}()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(map[string]string{"status": "verify_email", "email": body.Email})
 }
 
 // handleLogin authenticates an existing user and returns a fresh JWT.
@@ -1961,9 +1989,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
 	var userID, passwordHash, streamKey, role string
+	var isVerified bool
 	err := db.QueryRow(
-		`SELECT id, password_hash, stream_key, role FROM users WHERE email = $1`, body.Email,
-	).Scan(&userID, &passwordHash, &streamKey, &role)
+		`SELECT id, password_hash, stream_key, role, is_email_verified FROM users WHERE email = $1`, body.Email,
+	).Scan(&userID, &passwordHash, &streamKey, &role, &isVerified)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
@@ -1974,6 +2003,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(body.Password)); err != nil {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	if !isVerified {
+		http.Error(w, "email_not_verified", http.StatusForbidden)
 		return
 	}
 	var stationName string
@@ -1995,6 +2028,198 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(loginResp)
+}
+
+// POST /api/auth/verify-otp  {"email":"...","otp":"..."}
+func handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Email string `json:"email"`
+		OTP   string `json:"otp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+	body.OTP = strings.TrimSpace(body.OTP)
+
+	var userID, storedOTP, otpExp, streamKey, firstName, stationName string
+	err := db.QueryRow(
+		`SELECT u.id, u.otp_code, u.otp_expires_at, u.stream_key, u.first_name,
+		        COALESCE(s.station_name, '') FROM users u
+		 LEFT JOIN stations s ON s.user_id = u.id
+		 WHERE u.email = $1`, body.Email,
+	).Scan(&userID, &storedOTP, &otpExp, &streamKey, &firstName, &stationName)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "invalid code", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if storedOTP == "" || storedOTP != body.OTP {
+		http.Error(w, "invalid code", http.StatusUnauthorized)
+		return
+	}
+	exp, _ := time.Parse(time.RFC3339, otpExp)
+	if time.Now().UTC().After(exp) {
+		http.Error(w, "code expired", http.StatusUnauthorized)
+		return
+	}
+	_, _ = db.Exec(`UPDATE users SET is_email_verified = true, otp_code = '', otp_expires_at = '' WHERE id = $1`, userID)
+	token, err := jwtSign(userID, body.Email, stationName, "user")
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	stationSlug, _ := ensureStation(userID, body.Email, stationName, "")
+	go func() {
+		if err := sendWelcomeEmail(body.Email, firstName); err != nil {
+			log.Printf("[email] welcome to %s: %v", body.Email, err)
+		}
+	}()
+	resp := map[string]string{
+		"token":      token,
+		"stream_key": streamKey,
+		"rtmp_url":   rtmpIngestBase + "/" + streamKey,
+	}
+	if stationSlug != "" {
+		resp["station_slug"] = stationSlug
+		resp["listen_url"] = "/listen/" + stationSlug
+		resp["hub_listen_url"] = "/listen/" + stationSlug
+	}
+	resp["icecast_listen_url"] = "/icecast/" + streamKey
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// POST /api/auth/resend-otp  {"email":"..."}
+func handleResendOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+	var userID, firstName string
+	var verified bool
+	err := db.QueryRow(`SELECT id, first_name, is_email_verified FROM users WHERE email = $1`, body.Email).
+		Scan(&userID, &firstName, &verified)
+	if errors.Is(err, sql.ErrNoRows) || verified {
+		// Always return 200 — don't leak account existence
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	otp, err := generateOTP()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	exp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
+	_, _ = db.Exec(`UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`, otp, exp, userID)
+	go func() {
+		if err := sendOTPEmail(body.Email, firstName, otp); err != nil {
+			log.Printf("[email] resend OTP to %s: %v", body.Email, err)
+		}
+	}()
+	w.WriteHeader(http.StatusOK)
+}
+
+// POST /api/auth/forgot-password  {"email":"..."}
+func handleForgotPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+	// Always return 200 — don't leak whether the email exists
+	w.WriteHeader(http.StatusOK)
+
+	var userID, firstName string
+	err := db.QueryRow(`SELECT id, first_name FROM users WHERE email = $1 AND is_email_verified = true`, body.Email).
+		Scan(&userID, &firstName)
+	if err != nil {
+		return
+	}
+	tokenBytes := make([]byte, 32)
+	if _, err = rand.Read(tokenBytes); err != nil {
+		return
+	}
+	resetToken := hex.EncodeToString(tokenBytes)
+	exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	_, _ = db.Exec(`UPDATE users SET reset_token = $1, reset_expires_at = $2 WHERE id = $3`, resetToken, exp, userID)
+	baseURL := os.Getenv("APP_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://radioinonestop.com"
+	}
+	resetLink := baseURL + "/reset-password?token=" + resetToken
+	go func() {
+		if err := sendPasswordResetEmail(body.Email, firstName, resetLink); err != nil {
+			log.Printf("[email] reset password to %s: %v", body.Email, err)
+		}
+	}()
+}
+
+// POST /api/auth/reset-password  {"token":"...","password":"..."}
+func handleResetPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Token    string `json:"token"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Token = strings.TrimSpace(body.Token)
+	if len(body.Password) < 8 {
+		http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
+		return
+	}
+	var userID, resetExp string
+	err := db.QueryRow(`SELECT id, reset_expires_at FROM users WHERE reset_token = $1 AND reset_token != ''`, body.Token).
+		Scan(&userID, &resetExp)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "invalid or expired reset link", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	exp, _ := time.Parse(time.RFC3339, resetExp)
+	if time.Now().UTC().After(exp) {
+		http.Error(w, "invalid or expired reset link", http.StatusUnauthorized)
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	_, _ = db.Exec(`UPDATE users SET password_hash = $1, reset_token = '', reset_expires_at = '' WHERE id = $2`, string(hash), userID)
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleUserProfile dispatches GET/PUT on /api/user/profile.
@@ -6025,7 +6250,7 @@ func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
 	case "BILLING.SUBSCRIPTION.CREATED", "BILLING.SUBSCRIPTION.ACTIVATED":
 		// Activate subscription
 		_, err := db.Exec(`
-			UPDATE stations 
+			UPDATE stations
 			SET paypal_subscription_id = $1, is_suspended = false
 			WHERE user_id = (SELECT id FROM users WHERE email = $2)
 		`, subscriptionID, email)
@@ -6033,6 +6258,13 @@ func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[paypal webhook] Failed to activate: %v", err)
 		} else {
 			log.Printf("[paypal webhook] Activated subscription for %s", email)
+			var firstName, plan string
+			_ = db.QueryRow(`SELECT u.first_name, COALESCE(s.plan,'') FROM users u LEFT JOIN stations s ON s.user_id = u.id WHERE u.email = $1`, email).Scan(&firstName, &plan)
+			go func() {
+				if err := sendSubscriptionConfirmedEmail(email, firstName, plan); err != nil {
+					log.Printf("[email] subscription confirmed to %s: %v", email, err)
+				}
+			}()
 		}
 
 	case "BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED":
@@ -6060,9 +6292,14 @@ func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
-		// Payment failed - suspend after grace period
 		log.Printf("[paypal webhook] Payment failed for subscription %s", subscriptionID)
-		// You might want to send email notification here
+		var firstName string
+		_ = db.QueryRow(`SELECT u.first_name FROM users u INNER JOIN stations s ON s.user_id = u.id WHERE s.paypal_subscription_id = $1`, subscriptionID).Scan(&firstName)
+		go func() {
+			if err := sendSubscriptionFailedEmail(email, firstName); err != nil {
+				log.Printf("[email] payment failed to %s: %v", email, err)
+			}
+		}()
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -7515,6 +7752,10 @@ func main() {
 	mux.HandleFunc("/ws/chat", handleChat)
 	mux.HandleFunc("/api/auth/register", handleRegister)
 	mux.HandleFunc("/api/auth/login", handleLogin)
+	mux.HandleFunc("/api/auth/verify-otp", handleVerifyOTP)
+	mux.HandleFunc("/api/auth/resend-otp", handleResendOTP)
+	mux.HandleFunc("/api/auth/forgot-password", handleForgotPassword)
+	mux.HandleFunc("/api/auth/reset-password", handleResetPassword)
 	mux.HandleFunc("/api/auth/", handleOAuthRoute) // platform OAuth connect + callback
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
 	mux.HandleFunc("/api/schedules", requireAuth(handleSchedules))
