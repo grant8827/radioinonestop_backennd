@@ -55,6 +55,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/lib/pq"
 	"github.com/livekit/protocol/auth"
+	lkproto "github.com/livekit/protocol/livekit"
+	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/oschwald/geoip2-golang"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -743,6 +745,47 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
+
+	// Force-update plan features and is_featured to current authoritative values.
+	_, _ = db.Exec(`
+		UPDATE package_plans SET
+			features = CASE id
+				WHEN 'starter' THEN jsonb_build_array(
+					'Radio DJ & Mixer',
+					'Custom stream URL',
+					'Embeddable player widget',
+					'Listeners analytics',
+					'Up to 500 concurrent listeners',
+					'Record sessions'
+				)
+				WHEN 'professional' THEN jsonb_build_array(
+					'Everything in Starter',
+					'Track Scheduler',
+					'Conference rooms (up to 2 guests)',
+					'Priority audio processing',
+					'Up to 1,000 concurrent listeners'
+				)
+				WHEN 'enterprise' THEN jsonb_build_array(
+					'Everything in Professional',
+					'Conference rooms (up to 5 guests)',
+					'Higher bitrate radio streaming',
+					'Advanced listener reporting',
+					'Priority station support',
+					'Up to 2,000 concurrent listeners'
+				)
+				WHEN 'ultimate' THEN jsonb_build_array(
+					'Everything in Enterprise',
+					'Conference rooms (up to 20 guests)',
+					'Premium radio automation',
+					'Advanced analytics dashboard',
+					'Custom branding options',
+					'Unlimited concurrent listeners'
+				)
+				ELSE features
+			END,
+			is_featured = (id = 'professional')
+		WHERE id IN ('starter','professional','enterprise','ultimate')
+	`)
 
 	// Create marketing content table
 	_, err = db.Exec(`
@@ -2955,10 +2998,20 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// conferenceGuestLimits maps plan name \u2192 max number of guests (excluding host).
+var conferenceGuestLimits = map[string]int{
+	"starter":      2,
+	"professional": 2,
+	"enterprise":   5,
+	"ultimate":     20,
+}
+
 // handleConferenceToken issues a short-lived LiveKit JWT so the browser
 // can join an audio conference room. For authenticated users the display
 // name is always read from the stations table (authoritative). Guests
 // (no valid JWT) fall back to the ?username= query param.
+// The room name is expected to be the host's user ID so guest limits
+// can be enforced per plan.
 func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2976,7 +3029,7 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "room must be \u2264 64 characters", http.StatusBadRequest)
 		return
 	}
-	// Restrict room to safe characters (UUID-like: hex + hyphens)
+	// Restrict room to safe characters (hex user IDs + hyphens + letters)
 	for _, c := range room {
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
 			http.Error(w, "invalid room id", http.StatusBadRequest)
@@ -2984,13 +3037,50 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If the request carries a valid auth token, look up the station name
-	// from the DB so it is always current, regardless of JWT age.
+	apiKey := os.Getenv("LIVEKIT_API_KEY")
+	apiSecret := os.Getenv("LIVEKIT_API_SECRET")
+	livekitURL := os.Getenv("LIVEKIT_URL")
+
+	if apiKey == "" || apiSecret == "" || livekitURL == "" {
+		http.Error(w, "conference not configured on server", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Determine if the requester is the room owner (authenticated user whose ID = room).
+	isRoomOwner := false
 	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 		if claims, err := jwtVerify(strings.TrimPrefix(authHeader, "Bearer ")); err == nil && claims.UserID != "" {
+			// Look up station name from DB (always authoritative).
 			var stationName string
 			if dbErr := db.QueryRow(`SELECT station_name FROM stations WHERE user_id = $1`, claims.UserID).Scan(&stationName); dbErr == nil && strings.TrimSpace(stationName) != "" {
 				username = strings.TrimSpace(stationName)
+			}
+			if claims.UserID == room {
+				isRoomOwner = true
+			}
+		}
+	}
+
+	// Guests (anyone who is not the room owner) are subject to the plan's guest limit.
+	if !isRoomOwner {
+		var plan string
+		if dbErr := db.QueryRow(`SELECT plan FROM stations WHERE user_id = $1`, room).Scan(&plan); dbErr != nil {
+			plan = "professional" // fallback if room owner not found
+		}
+		limit, ok := conferenceGuestLimits[plan]
+		if !ok {
+			limit = 5
+		}
+
+		// Count current participants in the room via the LiveKit room service.
+		httpURL := strings.Replace(livekitURL, "wss://", "https://", 1)
+		httpURL = strings.Replace(httpURL, "ws://", "http://", 1)
+		roomClient := lksdk.NewRoomServiceClient(httpURL, apiKey, apiSecret)
+		if resp, err := roomClient.ListParticipants(r.Context(), &lkproto.ListParticipantsRequest{Room: room}); err == nil {
+			// Participants include the host. Allow up to limit+1 total (host + N guests).
+			if len(resp.Participants) >= limit+1 {
+				http.Error(w, fmt.Sprintf("Room is full (%d/%d guests)", limit, limit), http.StatusForbidden)
+				return
 			}
 		}
 	}
@@ -3031,15 +3121,6 @@ func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
 	participantIdentity := fmt.Sprintf("%s-%s", identityBase, hex.EncodeToString(identityBytes))
 	if len(participantIdentity) > 96 {
 		participantIdentity = participantIdentity[len(participantIdentity)-96:]
-	}
-
-	apiKey := os.Getenv("LIVEKIT_API_KEY")
-	apiSecret := os.Getenv("LIVEKIT_API_SECRET")
-	livekitURL := os.Getenv("LIVEKIT_URL")
-
-	if apiKey == "" || apiSecret == "" || livekitURL == "" {
-		http.Error(w, "conference not configured on server", http.StatusServiceUnavailable)
-		return
 	}
 
 	canPublish := true
