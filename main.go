@@ -7967,3 +7967,4 @@ func main() {
 	log.Printf("[http] RTMP ingest: rtmp://localhost:%s/live/<streamKey>", RTMPPort)
 	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(mux)))
 }
+
