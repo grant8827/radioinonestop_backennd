@@ -54,9 +54,6 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/lib/pq"
-	"github.com/livekit/protocol/auth"
-	lkproto "github.com/livekit/protocol/livekit"
-	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/oschwald/geoip2-golang"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -3006,150 +3003,208 @@ var conferenceGuestLimits = map[string]int{
 	"ultimate":     20,
 }
 
-// handleConferenceToken issues a short-lived LiveKit JWT so the browser
-// can join an audio conference room. For authenticated users the display
-// name is always read from the stations table (authoritative). Guests
-// (no valid JWT) fall back to the ?username= query param.
-// The room name is expected to be the host's user ID so guest limits
-// can be enforced per plan.
-func handleConferenceToken(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+// \u2500\u2500\u2500 Conference WebRTC Signaling \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-	room := strings.TrimSpace(r.URL.Query().Get("room"))
+type confPeer struct {
+	id       string
+	username string
+	isHost   bool
+	mu       sync.Mutex
+	conn     *websocket.Conn
+}
+
+func (p *confPeer) writeJSON(v any) {
+	p.mu.Lock()
+	_ = p.conn.WriteJSON(v)
+	p.mu.Unlock()
+}
+
+type confRoomState struct {
+	mu    sync.RWMutex
+	peers map[string]*confPeer
+}
+
+var (
+	confRooms   = map[string]*confRoomState{}
+	confRoomsMu sync.Mutex
+)
+
+type confMsg struct {
+	Type      string          `json:"type"`
+	PeerID    string          `json:"peerId,omitempty"`
+	From      string          `json:"from,omitempty"`
+	To        string          `json:"to,omitempty"`
+	Username  string          `json:"username,omitempty"`
+	IsHost    bool            `json:"isHost,omitempty"`
+	Peers     []confPeerInfo  `json:"peers,omitempty"`
+	SDP       string          `json:"sdp,omitempty"`
+	Candidate json.RawMessage `json:"candidate,omitempty"`
+	Message   string          `json:"message,omitempty"`
+}
+
+type confPeerInfo struct {
+	PeerID   string `json:"peerId"`
+	Username string `json:"username"`
+	IsHost   bool   `json:"isHost"`
+}
+
+func handleConferenceSignal(w http.ResponseWriter, r *http.Request) {
+	roomID := strings.TrimSpace(r.URL.Query().Get("room"))
 	username := strings.TrimSpace(r.URL.Query().Get("username"))
+	token := r.URL.Query().Get("token")
 
-	if room == "" {
-		http.Error(w, "room is required", http.StatusBadRequest)
+	if roomID == "" || username == "" {
+		http.Error(w, "room and username required", http.StatusBadRequest)
 		return
 	}
-	if len(room) > 64 {
-		http.Error(w, "room must be \u2264 64 characters", http.StatusBadRequest)
-		return
-	}
-	// Restrict room to safe characters (hex user IDs + hyphens + letters)
-	for _, c := range room {
+	for _, c := range roomID {
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
 			http.Error(w, "invalid room id", http.StatusBadRequest)
 			return
 		}
 	}
 
-	apiKey := os.Getenv("LIVEKIT_API_KEY")
-	apiSecret := os.Getenv("LIVEKIT_API_SECRET")
-	livekitURL := os.Getenv("LIVEKIT_URL")
-
-	if apiKey == "" || apiSecret == "" || livekitURL == "" {
-		http.Error(w, "conference not configured on server", http.StatusServiceUnavailable)
-		return
-	}
-
-	// Determine if the requester is the room owner (authenticated user whose ID = room).
 	isRoomOwner := false
-	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
-		if claims, err := jwtVerify(strings.TrimPrefix(authHeader, "Bearer ")); err == nil && claims.UserID != "" {
-			// Look up station name from DB (always authoritative).
+	if token != "" {
+		if claims, err := jwtVerify(token); err == nil && claims.UserID == roomID {
+			isRoomOwner = true
 			var stationName string
 			if dbErr := db.QueryRow(`SELECT station_name FROM stations WHERE user_id = $1`, claims.UserID).Scan(&stationName); dbErr == nil && strings.TrimSpace(stationName) != "" {
 				username = strings.TrimSpace(stationName)
 			}
-			if claims.UserID == room {
-				isRoomOwner = true
-			}
 		}
 	}
 
-	// Guests (anyone who is not the room owner) are subject to the plan's guest limit.
 	if !isRoomOwner {
 		var plan string
-		if dbErr := db.QueryRow(`SELECT plan FROM stations WHERE user_id = $1`, room).Scan(&plan); dbErr != nil {
-			plan = "professional" // fallback if room owner not found
+		if dbErr := db.QueryRow(`SELECT plan FROM stations WHERE user_id = $1`, roomID).Scan(&plan); dbErr != nil {
+			plan = "professional"
 		}
 		limit, ok := conferenceGuestLimits[plan]
 		if !ok {
 			limit = 5
 		}
+		confRoomsMu.Lock()
+		existing := confRooms[roomID]
+		var count int
+		if existing != nil {
+			existing.mu.RLock()
+			count = len(existing.peers)
+			existing.mu.RUnlock()
+		}
+		confRoomsMu.Unlock()
+		if count >= limit+1 {
+			http.Error(w, fmt.Sprintf("Room is full (%d/%d guests)", limit, limit), http.StatusForbidden)
+			return
+		}
+	}
 
-		// Count current participants in the room via the LiveKit room service.
-		httpURL := strings.Replace(livekitURL, "wss://", "https://", 1)
-		httpURL = strings.Replace(httpURL, "ws://", "http://", 1)
-		roomClient := lksdk.NewRoomServiceClient(httpURL, apiKey, apiSecret)
-		if resp, err := roomClient.ListParticipants(r.Context(), &lkproto.ListParticipantsRequest{Room: room}); err == nil {
-			// Participants include the host. Allow up to limit+1 total (host + N guests).
-			if len(resp.Participants) >= limit+1 {
-				http.Error(w, fmt.Sprintf("Room is full (%d/%d guests)", limit, limit), http.StatusForbidden)
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	idBytes := make([]byte, 6)
+	rand.Read(idBytes)
+	peerID := hex.EncodeToString(idBytes)
+
+	peer := &confPeer{id: peerID, username: username, isHost: isRoomOwner, conn: conn}
+
+	confRoomsMu.Lock()
+	room, exists := confRooms[roomID]
+	if !exists {
+		room = &confRoomState{peers: make(map[string]*confPeer)}
+		confRooms[roomID] = room
+	}
+	confRoomsMu.Unlock()
+
+	room.mu.Lock()
+	snapshot := make([]confPeerInfo, 0, len(room.peers))
+	for _, p := range room.peers {
+		snapshot = append(snapshot, confPeerInfo{PeerID: p.id, Username: p.username, IsHost: p.isHost})
+	}
+	room.peers[peerID] = peer
+	room.mu.Unlock()
+
+	peer.writeJSON(confMsg{Type: "joined", PeerID: peerID, IsHost: isRoomOwner, Peers: snapshot})
+
+	joined := confMsg{Type: "peer_joined", PeerID: peerID, Username: username, IsHost: isRoomOwner}
+	room.mu.RLock()
+	for id, p := range room.peers {
+		if id != peerID {
+			p.writeJSON(joined)
+		}
+	}
+	room.mu.RUnlock()
+
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(25 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				peer.mu.Lock()
+				_ = conn.WriteMessage(websocket.PingMessage, nil)
+				peer.mu.Unlock()
+			case <-done:
 				return
 			}
 		}
-	}
+	}()
 
-	if username == "" {
-		http.Error(w, "username is required", http.StatusBadRequest)
-		return
-	}
-	if len(username) > 64 {
-		username = username[:64]
-	}
-
-	identityBytes := make([]byte, 6)
-	if _, err := rand.Read(identityBytes); err != nil {
-		http.Error(w, "failed to generate participant identity", http.StatusInternalServerError)
-		return
-	}
-	identityBase := strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z':
-			return r
-		case r >= 'A' && r <= 'Z':
-			return r + 32
-		case r >= '0' && r <= '9':
-			return r
-		case r == '-' || r == '_':
-			return r
-		case r == ' ' || r == '.':
-			return '-'
-		default:
-			return -1
-		}
-	}, username)
-	identityBase = strings.Trim(identityBase, "-_")
-	if identityBase == "" {
-		identityBase = "guest"
-	}
-	participantIdentity := fmt.Sprintf("%s-%s", identityBase, hex.EncodeToString(identityBytes))
-	if len(participantIdentity) > 96 {
-		participantIdentity = participantIdentity[len(participantIdentity)-96:]
-	}
-
-	canPublish := true
-	canSubscribe := true
-
-	at := auth.NewAccessToken(apiKey, apiSecret)
-	grant := &auth.VideoGrant{
-		RoomJoin:     true,
-		Room:         room,
-		CanPublish:   &canPublish,
-		CanSubscribe: &canSubscribe,
-	}
-	at.AddGrant(grant).
-		SetIdentity(participantIdentity).
-		SetName(username).
-		SetValidFor(2 * time.Hour)
-
-	token, err := at.ToJWT()
-	if err != nil {
-		log.Printf("[conference] token generation failed: %v", err)
-		http.Error(w, "failed to generate token", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"token": token,
-		"url":   livekitURL,
+	conn.SetReadLimit(32 * 1024)
+	conn.SetReadDeadline(time.Now().Add(70 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(70 * time.Second))
+		return nil
 	})
+
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		conn.SetReadDeadline(time.Now().Add(70 * time.Second))
+		var msg confMsg
+		if json.Unmarshal(data, &msg) != nil {
+			continue
+		}
+		switch msg.Type {
+		case "offer", "answer", "candidate":
+			if msg.To == "" {
+				continue
+			}
+			room.mu.RLock()
+			target, ok := room.peers[msg.To]
+			room.mu.RUnlock()
+			if !ok {
+				continue
+			}
+			target.writeJSON(confMsg{Type: msg.Type, From: peerID, SDP: msg.SDP, Candidate: msg.Candidate})
+		}
+	}
+
+	close(done)
+	conn.Close()
+
+	room.mu.Lock()
+	delete(room.peers, peerID)
+	empty := len(room.peers) == 0
+	room.mu.Unlock()
+
+	if empty {
+		confRoomsMu.Lock()
+		delete(confRooms, roomID)
+		confRoomsMu.Unlock()
+	} else {
+		left := confMsg{Type: "peer_left", PeerID: peerID}
+		room.mu.RLock()
+		for _, p := range room.peers {
+			p.writeJSON(left)
+		}
+		room.mu.RUnlock()
+	}
 }
 
 // handleConfig returns/updates station metadata.
@@ -7832,7 +7887,7 @@ func main() {
 	// HTTP routes
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/analytics", requireAuth(handleAnalytics))
-	mux.HandleFunc("/api/conference/token", handleConferenceToken)
+	mux.HandleFunc("/ws/conference", handleConferenceSignal)
 	mux.HandleFunc("/api/health", handleHealth)
 	mux.HandleFunc("/api/config", handleConfig)
 	mux.HandleFunc("/api/streams", handleStreams)
