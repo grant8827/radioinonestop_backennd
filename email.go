@@ -1,33 +1,19 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
+	"crypto/tls"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
+	"net/smtp"
 	"os"
 	"time"
 )
 
 const (
-	mailtrapSendURL = "https://send.api.mailtrap.io/api/send"
-	emailFromAddr   = "noreply@radioinonestop.com"
-	emailFromName   = "Radio In One Stop"
+	emailFromAddr = "noreply@radioinonestop.com"
+	emailFromName = "Radio In One Stop"
+	smtpHost      = "live.smtp.mailtrap.io"
+	smtpPort      = "587"
 )
-
-type mailtrapPayload struct {
-	From    mailtrapAddr   `json:"from"`
-	To      []mailtrapAddr `json:"to"`
-	Subject string         `json:"subject"`
-	HTML    string         `json:"html"`
-}
-
-type mailtrapAddr struct {
-	Email string `json:"email"`
-	Name  string `json:"name,omitempty"`
-}
 
 func sendMail(to, subject, htmlBody string) error {
 	token := os.Getenv("MAILTRAP_API_TOKEN")
@@ -35,38 +21,44 @@ func sendMail(to, subject, htmlBody string) error {
 		return fmt.Errorf("MAILTRAP_API_TOKEN env var not set")
 	}
 
-	payload := mailtrapPayload{
-		From:    mailtrapAddr{Email: emailFromAddr, Name: emailFromName},
-		To:      []mailtrapAddr{{Email: to}},
-		Subject: subject,
-		HTML:    htmlBody,
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
-	}
+	from := fmt.Sprintf("%s <%s>", emailFromName, emailFromAddr)
+	msg := "MIME-Version: 1.0\r\n" +
+		"Content-Type: text/html; charset=UTF-8\r\n" +
+		"From: " + from + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n" +
+		"\r\n" +
+		htmlBody
 
-	req, err := http.NewRequest(http.MethodPost, mailtrapSendURL, bytes.NewReader(body))
+	client, err := smtp.Dial(smtpHost + ":" + smtpPort)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return fmt.Errorf("dial: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
+	defer client.Close()
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	if err = client.StartTLS(&tls.Config{ServerName: smtpHost}); err != nil {
+		return fmt.Errorf("starttls: %w", err)
+	}
+	if err = client.Auth(smtp.PlainAuth("", "api", token, smtpHost)); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+	if err = client.Mail(emailFromAddr); err != nil {
+		return fmt.Errorf("mail from: %w", err)
+	}
+	if err = client.Rcpt(to); err != nil {
+		return fmt.Errorf("rcpt to: %w", err)
+	}
+	wc, err := client.Data()
 	if err != nil {
-		return fmt.Errorf("http send: %w", err)
+		return fmt.Errorf("data: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
-		log.Printf("[email] mailtrap %d to %s: %s", resp.StatusCode, to, string(raw))
-		return fmt.Errorf("mailtrap API error %d: %s", resp.StatusCode, string(raw))
+	if _, err = fmt.Fprint(wc, msg); err != nil {
+		return fmt.Errorf("write body: %w", err)
 	}
-	log.Printf("[email] sent %q to %s", subject, to)
-	return nil
+	if err = wc.Close(); err != nil {
+		return fmt.Errorf("close data: %w", err)
+	}
+	return client.Quit()
 }
 
 func sendOTPEmail(to, firstName, otp string) error {
@@ -105,14 +97,14 @@ func emailBase(title, preheader, content string) string {
 <tr><td align="center">
 <table width="100%%" cellpadding="0" cellspacing="0" style="max-width:560px;">
   <tr><td style="background:linear-gradient(135deg,#4c1d95,#1e3a8a);border-radius:16px 16px 0 0;padding:32px;text-align:center;">
-    <p style="margin:0 0 12px;font-size:32px;">📻</p>
+    <p style="margin:0 0 12px;font-size:32px;">&#128251;</p>
     <h1 style="margin:0;color:white;font-size:22px;font-weight:bold;">Radio In One Stop</h1>
   </td></tr>
   <tr><td style="background:#0f0f1a;padding:40px 32px;border-left:1px solid rgba(255,255,255,0.08);border-right:1px solid rgba(255,255,255,0.08);">
     %s
   </td></tr>
   <tr><td style="background:#0a0a12;border:1px solid rgba(255,255,255,0.05);border-top:none;border-radius:0 0 16px 16px;padding:20px 32px;text-align:center;">
-    <p style="margin:0;color:#6b7280;font-size:12px;">© %d Radio In One Stop</p>
+    <p style="margin:0;color:#6b7280;font-size:12px;">&copy; %d Radio In One Stop. You received this email because you registered at radioinonestop.com.</p>
   </td></tr>
 </table>
 </td></tr>
@@ -129,16 +121,16 @@ func emailOTPHTML(firstName, otp string) string {
   <p style="margin:0 0 8px;color:#9ca3af;font-size:11px;text-transform:uppercase;letter-spacing:3px;">Verification Code</p>
   <p style="margin:0;color:white;font-size:44px;font-weight:bold;letter-spacing:10px;font-family:monospace;">%s</p>
 </div>
-<p style="margin:0;color:#6b7280;font-size:13px;">If you didn't create an account, you can safely ignore this email.</p>`, firstName, otp)
+<p style="margin:0;color:#6b7280;font-size:13px;">If you did not create an account at radioinonestop.com you can safely ignore this email.</p>`, firstName, otp)
 	return emailBase("Verify your email", "Your verification code is "+otp, content)
 }
 
 func emailWelcomeHTML(firstName string) string {
 	content := fmt.Sprintf(`
-<h2 style="margin:0 0 8px;color:white;font-size:20px;font-weight:bold;">Welcome aboard, %s! 🎙️</h2>
+<h2 style="margin:0 0 8px;color:white;font-size:20px;font-weight:bold;">Welcome aboard, %s!</h2>
 <p style="margin:0 0 24px;color:#9ca3af;font-size:15px;line-height:1.6;">Your email is verified and your Radio In One Stop account is ready. Start broadcasting to the world!</p>
 <div style="text-align:center;margin:32px 0;">
-  <a href="https://radioinonestop.com" style="background:linear-gradient(135deg,#dc2626,#b45309);color:white;text-decoration:none;padding:14px 32px;border-radius:10px;font-weight:bold;font-size:15px;">Go to your Studio →</a>
+  <a href="https://radioinonestop.com" style="background:linear-gradient(135deg,#dc2626,#b45309);color:white;text-decoration:none;padding:14px 32px;border-radius:10px;font-weight:bold;font-size:15px;">Go to your Studio</a>
 </div>
 <p style="margin:0;color:#6b7280;font-size:13px;">Need help? Reach out to us anytime.</p>`, firstName)
 	return emailBase("Welcome to Radio In One Stop!", "Your account is ready", content)
@@ -151,18 +143,18 @@ func emailPasswordResetHTML(firstName, resetLink string) string {
 <div style="text-align:center;margin:32px 0;">
   <a href="%s" style="background:linear-gradient(135deg,#dc2626,#b45309);color:white;text-decoration:none;padding:14px 32px;border-radius:10px;font-weight:bold;font-size:15px;">Reset my password</a>
 </div>
-<p style="margin:0 0 12px;color:#6b7280;font-size:13px;">If the button doesn't work, copy and paste this link into your browser:</p>
+<p style="margin:0 0 12px;color:#6b7280;font-size:13px;">If the button does not work, copy and paste this link into your browser:</p>
 <p style="margin:0;color:#9ca3af;font-size:12px;word-break:break-all;">%s</p>
-<p style="margin:24px 0 0;color:#6b7280;font-size:13px;">If you didn't request a password reset, you can safely ignore this email.</p>`, firstName, resetLink, resetLink)
+<p style="margin:24px 0 0;color:#6b7280;font-size:13px;">If you did not request a password reset you can safely ignore this email.</p>`, firstName, resetLink, resetLink)
 	return emailBase("Reset your password", "Reset your Radio In One Stop password", content)
 }
 
 func emailSubscriptionConfirmedHTML(firstName, plan string) string {
 	content := fmt.Sprintf(`
-<h2 style="margin:0 0 8px;color:white;font-size:20px;font-weight:bold;">Subscription confirmed! 🎉</h2>
+<h2 style="margin:0 0 8px;color:white;font-size:20px;font-weight:bold;">Subscription confirmed!</h2>
 <p style="margin:0 0 24px;color:#9ca3af;font-size:15px;line-height:1.6;">Hi %s, your <strong style="color:white;">%s</strong> plan is now active. Your station is live and ready for listeners!</p>
 <div style="text-align:center;margin:32px 0;">
-  <a href="https://radioinonestop.com" style="background:linear-gradient(135deg,#dc2626,#b45309);color:white;text-decoration:none;padding:14px 32px;border-radius:10px;font-weight:bold;font-size:15px;">Go to your Studio →</a>
+  <a href="https://radioinonestop.com" style="background:linear-gradient(135deg,#dc2626,#b45309);color:white;text-decoration:none;padding:14px 32px;border-radius:10px;font-weight:bold;font-size:15px;">Go to your Studio</a>
 </div>
 <p style="margin:0;color:#6b7280;font-size:13px;">Thank you for subscribing to Radio In One Stop.</p>`, firstName, plan)
 	return emailBase("Subscription confirmed!", "Your "+plan+" plan is now active", content)
@@ -170,11 +162,11 @@ func emailSubscriptionConfirmedHTML(firstName, plan string) string {
 
 func emailSubscriptionFailedHTML(firstName string) string {
 	content := fmt.Sprintf(`
-<h2 style="margin:0 0 8px;color:white;font-size:20px;font-weight:bold;">Payment failed ⚠️</h2>
+<h2 style="margin:0 0 8px;color:white;font-size:20px;font-weight:bold;">Payment failed</h2>
 <p style="margin:0 0 24px;color:#9ca3af;font-size:15px;line-height:1.6;">Hi %s, we were unable to process your subscription payment. Please update your payment method to keep your station active.</p>
 <div style="text-align:center;margin:32px 0;">
-  <a href="https://radioinonestop.com" style="background:linear-gradient(135deg,#dc2626,#b45309);color:white;text-decoration:none;padding:14px 32px;border-radius:10px;font-weight:bold;font-size:15px;">Update payment method →</a>
+  <a href="https://radioinonestop.com" style="background:linear-gradient(135deg,#dc2626,#b45309);color:white;text-decoration:none;padding:14px 32px;border-radius:10px;font-weight:bold;font-size:15px;">Update payment method</a>
 </div>
-<p style="margin:0;color:#6b7280;font-size:13px;">If you've already resolved this, you can ignore this email.</p>`, firstName)
-	return emailBase("Payment failed — action needed", "We couldn't process your payment", content)
+<p style="margin:0;color:#6b7280;font-size:13px;">If you have already resolved this you can ignore this email.</p>`, firstName)
+	return emailBase("Payment failed — action needed", "We could not process your payment", content)
 }
