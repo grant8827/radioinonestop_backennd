@@ -1,58 +1,72 @@
 package main
 
 import (
-	"crypto/tls"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"net/smtp"
+	"net/http"
 	"os"
 	"time"
 )
 
 const (
-	mailtrapHost  = "live.smtp.mailtrap.io"
-	mailtrapPort  = "587"
-	mailtrapUser  = "api"
-	emailFromAddr = "noreply@radioinonestop.com"
-	emailFromName = "Radio In One Stop"
+	mailtrapSendURL = "https://send.api.mailtrap.io/api/send"
+	emailFromAddr   = "noreply@radioinonestop.com"
+	emailFromName   = "Radio In One Stop"
 )
+
+type mailtrapPayload struct {
+	From    mailtrapAddr   `json:"from"`
+	To      []mailtrapAddr `json:"to"`
+	Subject string         `json:"subject"`
+	HTML    string         `json:"html"`
+}
+
+type mailtrapAddr struct {
+	Email string `json:"email"`
+	Name  string `json:"name,omitempty"`
+}
 
 func sendMail(to, subject, htmlBody string) error {
 	token := os.Getenv("MAILTRAP_API_TOKEN")
 	if token == "" {
 		return fmt.Errorf("MAILTRAP_API_TOKEN env var not set")
 	}
-	log.Printf("[email] dialing %s:%s to send to %s", mailtrapHost, mailtrapPort, to)
-	client, err := smtp.Dial(mailtrapHost + ":" + mailtrapPort)
+
+	payload := mailtrapPayload{
+		From:    mailtrapAddr{Email: emailFromAddr, Name: emailFromName},
+		To:      []mailtrapAddr{{Email: to}},
+		Subject: subject,
+		HTML:    htmlBody,
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("smtp dial: %w", err)
+		return fmt.Errorf("marshal payload: %w", err)
 	}
-	defer client.Close()
-	if err = client.StartTLS(&tls.Config{ServerName: mailtrapHost}); err != nil {
-		return fmt.Errorf("starttls: %w", err)
-	}
-	auth := smtp.PlainAuth("", mailtrapUser, token, mailtrapHost)
-	if err = client.Auth(auth); err != nil {
-		return fmt.Errorf("smtp auth: %w", err)
-	}
-	if err = client.Mail(emailFromAddr); err != nil {
-		return fmt.Errorf("smtp mail from: %w", err)
-	}
-	if err = client.Rcpt(to); err != nil {
-		return fmt.Errorf("smtp rcpt: %w", err)
-	}
-	w, err := client.Data()
+
+	req, err := http.NewRequest(http.MethodPost, mailtrapSendURL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("smtp data: %w", err)
+		return fmt.Errorf("build request: %w", err)
 	}
-	msg := fmt.Sprintf(
-		"From: %s <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-version: 1.0\r\nContent-Type: text/html; charset=\"UTF-8\"\r\n\r\n%s",
-		emailFromName, emailFromAddr, to, subject, htmlBody,
-	)
-	if _, err = fmt.Fprint(w, msg); err != nil {
-		return fmt.Errorf("smtp write: %w", err)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http send: %w", err)
 	}
-	return w.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		log.Printf("[email] mailtrap %d to %s: %s", resp.StatusCode, to, string(raw))
+		return fmt.Errorf("mailtrap API error %d: %s", resp.StatusCode, string(raw))
+	}
+	log.Printf("[email] sent %q to %s", subject, to)
+	return nil
 }
 
 func sendOTPEmail(to, firstName, otp string) error {
