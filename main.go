@@ -917,6 +917,8 @@ func initDB(dsn string) error {
 	_, _ = db.Exec(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS server_url TEXT NOT NULL DEFAULT ''`)
 	// Drop old UNIQUE(user_id, platform) to allow multiple destinations per platform.
 	_, _ = db.Exec(`ALTER TABLE destinations DROP CONSTRAINT IF EXISTS destinations_user_id_platform_key`)
+	// Enforce unique station names (case-insensitive), ignoring blank names.
+	_, _ = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_stations_lower_name ON stations (lower(station_name)) WHERE station_name != ''`)
 
 	// ── Seed Default Ad Placements ────────────────────────────────────────
 	defaultPlacements := []struct {
@@ -1934,10 +1936,6 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "last name is required", http.StatusBadRequest)
 		return
 	}
-	if body.StationName == "" {
-		http.Error(w, "station name is required", http.StatusBadRequest)
-		return
-	}
 	if len(body.Password) < 8 {
 		http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
 		return
@@ -1965,11 +1963,11 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		}
 		exp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
 		_, _ = db.Exec(`UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`, otp, exp, existingID)
-		go func() {
-			if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
-				log.Printf("[email] resend OTP to %s: %v", body.Email, err)
-			}
-		}()
+		if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
+			log.Printf("[email] resend OTP to %s: %v", body.Email, err)
+			http.Error(w, "failed to send verification email — please try again", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "verify_email", "email": body.Email})
 		return
@@ -2005,11 +2003,11 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	if body.Genre != "" || body.Description != "" {
 		_, _ = db.Exec(`UPDATE stations SET genre = $1, description = $2 WHERE user_id = $3`, body.Genre, body.Description, userID)
 	}
-	go func() {
-		if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
-			log.Printf("[email] send OTP to %s: %v", body.Email, err)
-		}
-	}()
+	if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
+		log.Printf("[email] send OTP to %s: %v", body.Email, err)
+		http.Error(w, "failed to send verification email — please try again", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "verify_email", "email": body.Email})
 }
@@ -2335,10 +2333,22 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		newStationName := strings.TrimSpace(body.StationName)
+		if newStationName != "" {
+			var takenBy string
+			_ = db.QueryRow(`SELECT user_id FROM stations WHERE lower(station_name) = lower($1) AND user_id != $2`, newStationName, userID).Scan(&takenBy)
+			if takenBy != "" {
+				http.Error(w, "station name already taken", http.StatusConflict)
+				return
+			}
+		}
 		if _, err := db.Exec(
 			`UPDATE stations SET station_name = $1, genre = $2, description = $3, logo_url = $4 WHERE user_id = $5`,
 			newStationName, body.Genre, strings.TrimSpace(body.Description), body.LogoURL, userID,
 		); err != nil {
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+				http.Error(w, "station name already taken", http.StatusConflict)
+				return
+			}
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
