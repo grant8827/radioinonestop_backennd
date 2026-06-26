@@ -2168,11 +2168,11 @@ func handleResendOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	exp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
 	_, _ = db.Exec(`UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`, otp, exp, userID)
-	go func() {
-		if err := sendOTPEmail(body.Email, firstName, otp); err != nil {
-			log.Printf("[email] resend OTP to %s: %v", body.Email, err)
-		}
-	}()
+	if err := sendOTPEmail(body.Email, firstName, otp); err != nil {
+		log.Printf("[email] resend OTP to %s: %v", body.Email, err)
+		http.Error(w, "failed to send verification email — please try again", http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -7977,4 +7977,3 @@ func main() {
 	log.Printf("[http] RTMP ingest: rtmp://localhost:%s/live/<streamKey>", RTMPPort)
 	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(mux)))
 }
-

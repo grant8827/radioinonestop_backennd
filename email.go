@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
+	"net"
 	"net/smtp"
 	"os"
 	"time"
@@ -13,9 +15,11 @@ const (
 	emailFromName = "Radio In One Stop"
 	smtpHost      = "live.smtp.mailtrap.io"
 	smtpPort      = "587"
+	smtpTimeout   = 10 * time.Second
 )
 
 func sendMail(to, subject, htmlBody string) error {
+	start := time.Now()
 	token := os.Getenv("MAILTRAP_API_TOKEN")
 	if token == "" {
 		return fmt.Errorf("MAILTRAP_API_TOKEN env var not set")
@@ -30,18 +34,28 @@ func sendMail(to, subject, htmlBody string) error {
 		"\r\n" +
 		htmlBody
 
-	client, err := smtp.Dial(smtpHost + ":" + smtpPort)
+	addr := smtpHost + ":" + smtpPort
+	conn, err := (&net.Dialer{Timeout: smtpTimeout}).Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(smtpTimeout))
+
+	client, err := smtp.NewClient(conn, smtpHost)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("smtp client: %w", err)
 	}
 	defer client.Close()
 
 	if err = client.StartTLS(&tls.Config{ServerName: smtpHost}); err != nil {
 		return fmt.Errorf("starttls: %w", err)
 	}
+	_ = conn.SetDeadline(time.Now().Add(smtpTimeout))
 	if err = client.Auth(smtp.PlainAuth("", "api", token, smtpHost)); err != nil {
 		return fmt.Errorf("auth: %w", err)
 	}
+	_ = conn.SetDeadline(time.Now().Add(smtpTimeout))
 	if err = client.Mail(emailFromAddr); err != nil {
 		return fmt.Errorf("mail from: %w", err)
 	}
@@ -58,7 +72,11 @@ func sendMail(to, subject, htmlBody string) error {
 	if err = wc.Close(); err != nil {
 		return fmt.Errorf("close data: %w", err)
 	}
-	return client.Quit()
+	if err = client.Quit(); err != nil {
+		return fmt.Errorf("quit: %w", err)
+	}
+	log.Printf("[email] sent to %s subject=%q duration=%s", to, subject, time.Since(start).Round(time.Millisecond))
+	return nil
 }
 
 func sendOTPEmail(to, firstName, otp string) error {
