@@ -4053,6 +4053,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	// FFmpeg args — exec.Command never passes these through a shell
 	args := []string{
 		"-loglevel", "error",
+		"-fflags", "nobuffer",
 		"-f", "webm",
 		"-i", "pipe:0",
 		"-vn",
@@ -4061,6 +4062,7 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		"-ar", "44100",
 		"-ac", "2",
 		"-content_type", contentType,
+		"-flush_packets", "1",
 		"-f", outFmt,
 		icecastURL.String(),
 	}
