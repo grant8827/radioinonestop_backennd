@@ -4000,10 +4000,10 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	if cfg.Bitrate == "" {
 		cfg.Bitrate = "192k"
 	}
-	codec := cfg.Codec
-	if codec != "aac" {
-		codec = "mp3"
-	}
+	// The shared standby source is MP3. Icecast can preserve a listener
+	// connection across fallback/override only when both mounts use the same
+	// content type, so keep every protected station mount on MP3 as well.
+	codec := "mp3"
 
 	// ── Server-side Icecast target override ───────────────────────────────
 	// ICECAST_HOST / ICECAST_PORT env vars let the server admin pin the
@@ -4095,6 +4095,9 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 
 	liveMarked := false
 	exitReason := "handler completed"
+	connectedAt := time.Now()
+	lastAudioAt := time.Time{}
+	audioBytes := int64(0)
 	markLive := func() {
 		if liveMarked {
 			return
@@ -4107,7 +4110,12 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[encoder/%s] first audio received; station marked live", claims.UserID)
 	}
 	defer func() {
-		log.Printf("[encoder/%s] stopped: %s", claims.UserID, exitReason)
+		lastAudio := "never"
+		if !lastAudioAt.IsZero() {
+			lastAudio = time.Since(lastAudioAt).Round(time.Millisecond).String() + " ago"
+		}
+		log.Printf("[encoder/%s] stopped after %s (audio_bytes=%d last_audio=%s): %s",
+			claims.UserID, time.Since(connectedAt).Round(time.Millisecond), audioBytes, lastAudio, exitReason)
 		if liveMarked {
 			liveEncoderSessions.clear(claims.UserID)
 			db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, claims.UserID) //nolint:errcheck
@@ -4180,6 +4188,8 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Binary audio chunk
+		lastAudioAt = time.Now()
+		audioBytes += int64(len(data))
 		if _, err := stdin.Write(data); err != nil {
 			exitReason = "FFmpeg stdin write failed: " + err.Error()
 			cancel()
