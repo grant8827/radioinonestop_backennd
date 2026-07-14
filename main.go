@@ -3628,8 +3628,16 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 func handleIcecastAuth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 
-	allow := func() { w.Write([]byte("awk=allow\r\n")) } //nolint:errcheck
-	deny := func() { w.Write([]byte("awk=deny\r\n")) }   //nolint:errcheck
+	allow := func() {
+		// Icecast URL authentication requires this response header. Keep the
+		// legacy response body for compatibility with older deployments.
+		w.Header().Set("Icecast-Auth-User", "1")
+		w.Write([]byte("awk=allow\r\n")) //nolint:errcheck
+	}
+	deny := func() {
+		w.Header().Set("Icecast-Auth-Message", "Invalid source credentials")
+		w.Write([]byte("awk=deny\r\n")) //nolint:errcheck
+	}
 
 	if err := r.ParseForm(); err != nil {
 		deny()
@@ -3642,7 +3650,7 @@ func handleIcecastAuth(w http.ResponseWriter, r *http.Request) {
 
 	// Non-source actions (e.g. listener auth) — allow by default.
 	action := r.FormValue("action")
-	if action != "source_auth" {
+	if action != "source_auth" && action != "stream_auth" {
 		allow()
 		return
 	}
