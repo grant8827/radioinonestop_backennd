@@ -2695,6 +2695,9 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 		"rtmp_ingest_base": rtmpIngestBase,
 		"destinations":     dests,
 		"source_password":  sourcePassword,
+		"icecast_host":     strings.TrimSpace(os.Getenv("ICECAST_HOST")),
+		"icecast_port":     strings.TrimSpace(os.Getenv("ICECAST_PORT")),
+		"icecast_username": "source",
 	}
 	if stationSlug != "" {
 		resp["station_slug"] = stationSlug
