@@ -2133,7 +2133,7 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 		resp["listen_url"] = "/listen/" + stationSlug
 		resp["hub_listen_url"] = "/listen/" + stationSlug
 	}
-	resp["icecast_listen_url"] = "/icecast/" + streamKey
+	resp["icecast_listen_url"] = publicIcecastListenURL(streamKey)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -2701,7 +2701,7 @@ func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
 		resp["listen_url"] = "/listen/" + stationSlug
 		resp["hub_listen_url"] = "/listen/" + stationSlug
 	}
-	resp["icecast_listen_url"] = "/icecast/" + streamKey
+	resp["icecast_listen_url"] = publicIcecastListenURL(streamKey)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -3488,7 +3488,21 @@ func sanitizePublicStationLiveState(userID string, isLive bool, icecastListenURL
 	if icecastListenURL != "" && !liveEncoderSessions.isLive(userID) {
 		return false, ""
 	}
+	if strings.HasPrefix(icecastListenURL, "/icecast/") {
+		icecastListenURL = publicIcecastListenURL(strings.TrimPrefix(icecastListenURL, "/icecast/"))
+	}
 	return isLive, icecastListenURL
+}
+
+// publicIcecastListenURL returns a direct listener URL when Icecast is hosted
+// outside the web application. Keeping the mount key as the only variable
+// makes this work for existing and newly registered stations alike.
+func publicIcecastListenURL(streamKey string) string {
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("ICECAST_PUBLIC_URL")), "/")
+	if base == "" {
+		return "/icecast/" + streamKey
+	}
+	return base + "/" + streamKey
 }
 
 // handleBroadcast is the hub-mode branch of the encoder WebSocket.
