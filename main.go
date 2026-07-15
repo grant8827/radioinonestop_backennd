@@ -703,6 +703,7 @@ func initDB(dsn string) error {
 			VALUES
 				('starter', 'Starter', jsonb_build_array(
 					'Radio DJ & Mixer',
+					'96 kbps audio streaming',
 					'Custom stream URL',
 					'Embeddable player widget',
 					'Listeners analytics',
@@ -711,6 +712,7 @@ func initDB(dsn string) error {
 				)),
 				('professional', 'Professional', jsonb_build_array(
 					'Everything in Starter',
+					'96 or 128 kbps audio streaming',
 					'Conference live-chat rooms',
 					'Up to 10 participants',
 					'Priority audio processing',
@@ -718,13 +720,14 @@ func initDB(dsn string) error {
 				)),
 				('enterprise', 'Enterprise', jsonb_build_array(
 					'Everything in Professional',
-					'Higher bitrate radio streaming',
+					'96, 128 or 192 kbps audio streaming',
 					'Advanced listener reporting',
 					'Priority station support',
 					'Up to 2000 concurrent listeners'
 				)),
 				('ultimate', 'Ultimate', jsonb_build_array(
 					'Everything in Enterprise',
+					'96, 128, 192 or 320 kbps audio streaming',
 					'Premium radio automation',
 					'Advanced analytics dashboard',
 					'Custom branding options',
@@ -749,6 +752,7 @@ func initDB(dsn string) error {
 			features = CASE id
 				WHEN 'starter' THEN jsonb_build_array(
 					'Radio DJ & Mixer',
+					'96 kbps audio streaming',
 					'Custom stream URL',
 					'Embeddable player widget',
 					'Listeners analytics',
@@ -757,6 +761,7 @@ func initDB(dsn string) error {
 				)
 				WHEN 'professional' THEN jsonb_build_array(
 					'Everything in Starter',
+					'96 or 128 kbps audio streaming',
 					'Track Scheduler',
 					'Conference rooms (up to 2 guests)',
 					'Priority audio processing',
@@ -765,13 +770,14 @@ func initDB(dsn string) error {
 				WHEN 'enterprise' THEN jsonb_build_array(
 					'Everything in Professional',
 					'Conference rooms (up to 5 guests)',
-					'Higher bitrate radio streaming',
+					'96, 128 or 192 kbps audio streaming',
 					'Advanced listener reporting',
 					'Priority station support',
 					'Up to 2,000 concurrent listeners'
 				)
 				WHEN 'ultimate' THEN jsonb_build_array(
 					'Everything in Enterprise',
+					'96, 128, 192 or 320 kbps audio streaming',
 					'Conference rooms (up to 20 guests)',
 					'Premium radio automation',
 					'Advanced analytics dashboard',
@@ -3387,6 +3393,21 @@ type encoderStatus struct {
 	Msg    string `json:"msg,omitempty"`
 }
 
+var planAudioBitrates = map[string]map[string]bool{
+	"starter":      {"96k": true},
+	"professional": {"96k": true, "128k": true},
+	"enterprise":   {"96k": true, "128k": true, "192k": true},
+	"ultimate":     {"96k": true, "128k": true, "192k": true, "320k": true},
+}
+
+func bitrateAllowedForPlan(plan, bitrate string) bool {
+	allowed, ok := planAudioBitrates[plan]
+	if !ok {
+		allowed = planAudioBitrates["starter"]
+	}
+	return allowed[bitrate]
+}
+
 type encoderSessionStore struct {
 	mu   sync.RWMutex
 	live map[string]bool
@@ -4023,7 +4044,12 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		cfg.Username = "source"
 	}
 	if cfg.Bitrate == "" {
-		cfg.Bitrate = "192k"
+		cfg.Bitrate = "96k"
+	}
+	plan := getUserPlan(claims.UserID)
+	if !bitrateAllowedForPlan(plan, cfg.Bitrate) {
+		sendStatus("error", fmt.Sprintf("%s bitrate is not available on the %s package", cfg.Bitrate, plan))
+		return
 	}
 	// The shared standby source is MP3. Icecast can preserve a listener
 	// connection across fallback/override only when both mounts use the same
