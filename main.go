@@ -3565,7 +3565,10 @@ func sanitizePublicStationLiveState(userID string, isLive bool, icecastListenURL
 func publicIcecastListenURL(streamKey string) string {
 	base := strings.TrimRight(strings.TrimSpace(os.Getenv("ICECAST_PUBLIC_URL")), "/")
 	if base == "" {
-		return "/icecast/" + streamKey
+		// Production Icecast runs on its public streaming host. The website's
+		// /icecast proxy depends on a private cross-service address and returns
+		// 502 when the frontend and Icecast are deployed on different providers.
+		base = "https://stream.radioinonestop.com"
 	}
 	return base + "/" + streamKey
 }
