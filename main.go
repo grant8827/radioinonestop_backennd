@@ -48,6 +48,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -59,6 +60,31 @@ import (
 )
 
 // ─── Configuration ────────────────────────────────────────────────────────────
+
+// allowedOrigins is the set of frontend origins permitted to make
+// cross-origin API calls and open the chat/encoder/conference WebSockets.
+// Configure via the comma-separated ALLOWED_ORIGINS env var; falls back to
+// the production frontend domain if unset.
+var allowedOrigins = parseAllowedOrigins(os.Getenv("ALLOWED_ORIGINS"))
+
+func parseAllowedOrigins(raw string) map[string]bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = "https://radioinonestop.com"
+	}
+	origins := map[string]bool{}
+	for _, o := range strings.Split(raw, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			origins[o] = true
+		}
+	}
+	return origins
+}
+
+func isAllowedOrigin(origin string) bool {
+	return origin != "" && allowedOrigins[origin]
+}
 
 // StationConfig holds runtime-editable station metadata.
 type StationConfig struct {
@@ -432,7 +458,7 @@ var (
 	upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
-		CheckOrigin:     func(r *http.Request) bool { return true },
+		CheckOrigin:     func(r *http.Request) bool { return isAllowedOrigin(r.Header.Get("Origin")) },
 	}
 
 	streams *streamManager
@@ -1894,6 +1920,104 @@ func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ── Auth rate limiting (in-memory, per-process) ─────────────────────────────
+// Bounds OTP brute-forcing, OTP-resend spam, and password-guessing against
+// login. Keyed by email — every one of these endpoints already targets a
+// specific account, so per-account throttling is what actually matters here.
+// State resets on process restart and isn't shared across instances; that's
+// an accepted tradeoff for a single-process deployment rather than adding a
+// Redis/DB dependency for this.
+
+type authAttemptEntry struct {
+	count   int
+	firstAt time.Time
+}
+
+var (
+	otpVerifyAttemptsMu sync.Mutex
+	otpVerifyAttempts   = map[string]*authAttemptEntry{}
+
+	otpResendAtMu sync.Mutex
+	otpResendAt   = map[string]time.Time{}
+
+	loginAttemptsMu  sync.Mutex
+	loginAttemptsMap = map[string]*authAttemptEntry{}
+)
+
+const (
+	otpVerifyMaxAttempts = 5
+	otpVerifyWindow      = 15 * time.Minute
+	otpResendCooldown    = 60 * time.Second
+	loginMaxAttempts     = 8
+	loginLockoutWindow   = 15 * time.Minute
+)
+
+// otpVerifyRateLimited records this attempt and reports whether email has
+// exceeded its guess budget for the current OTP.
+func otpVerifyRateLimited(email string) bool {
+	otpVerifyAttemptsMu.Lock()
+	defer otpVerifyAttemptsMu.Unlock()
+	now := time.Now()
+	entry := otpVerifyAttempts[email]
+	if entry == nil || now.Sub(entry.firstAt) > otpVerifyWindow {
+		entry = &authAttemptEntry{firstAt: now}
+		otpVerifyAttempts[email] = entry
+	}
+	entry.count++
+	return entry.count > otpVerifyMaxAttempts
+}
+
+func otpVerifyResetAttempts(email string) {
+	otpVerifyAttemptsMu.Lock()
+	delete(otpVerifyAttempts, email)
+	otpVerifyAttemptsMu.Unlock()
+}
+
+// otpResendRateLimited reports whether email requested a resend too recently,
+// and records this request as the new "last sent" time if not.
+func otpResendRateLimited(email string) bool {
+	otpResendAtMu.Lock()
+	defer otpResendAtMu.Unlock()
+	if last, ok := otpResendAt[email]; ok && time.Since(last) < otpResendCooldown {
+		return true
+	}
+	otpResendAt[email] = time.Now()
+	return false
+}
+
+// loginRateLimited reports whether email has too many recent failed logins.
+func loginRateLimited(email string) bool {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+	entry := loginAttemptsMap[email]
+	if entry == nil {
+		return false
+	}
+	if time.Since(entry.firstAt) > loginLockoutWindow {
+		delete(loginAttemptsMap, email)
+		return false
+	}
+	return entry.count >= loginMaxAttempts
+}
+
+func loginRecordFailure(email string) {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+	now := time.Now()
+	entry := loginAttemptsMap[email]
+	if entry == nil || now.Sub(entry.firstAt) > loginLockoutWindow {
+		entry = &authAttemptEntry{firstAt: now}
+		loginAttemptsMap[email] = entry
+	}
+	entry.count++
+}
+
+func loginRecordSuccess(email string) {
+	loginAttemptsMu.Lock()
+	delete(loginAttemptsMap, email)
+	loginAttemptsMu.Unlock()
+}
+
 // handleRegister creates a new user with an auto-generated stream key.
 func generateOTP() (string, error) {
 	b := make([]byte, 4)
@@ -1969,6 +2093,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		}
 		exp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
 		_, _ = db.Exec(`UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`, otp, exp, existingID)
+		otpVerifyResetAttempts(body.Email)
 		if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
 			log.Printf("[email] resend OTP to %s: %v", body.Email, err)
 			http.Error(w, "failed to send verification email — please try again", http.StatusInternalServerError)
@@ -2034,12 +2159,19 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+
+	if loginRateLimited(body.Email) {
+		http.Error(w, "too many failed attempts — please try again later", http.StatusTooManyRequests)
+		return
+	}
+
 	var userID, passwordHash, streamKey, role string
 	var isVerified bool
 	err := db.QueryRow(
 		`SELECT id, password_hash, stream_key, role, is_email_verified FROM users WHERE email = $1`, body.Email,
 	).Scan(&userID, &passwordHash, &streamKey, &role, &isVerified)
 	if errors.Is(err, sql.ErrNoRows) {
+		loginRecordFailure(body.Email)
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -2048,9 +2180,11 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(body.Password)); err != nil {
+		loginRecordFailure(body.Email)
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
+	loginRecordSuccess(body.Email)
 	if !isVerified {
 		http.Error(w, "email_not_verified", http.StatusForbidden)
 		return
@@ -2093,6 +2227,11 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
 	body.OTP = strings.TrimSpace(body.OTP)
 
+	if otpVerifyRateLimited(body.Email) {
+		http.Error(w, "too many attempts — request a new code", http.StatusTooManyRequests)
+		return
+	}
+
 	var userID, storedOTP, otpExp, streamKey, firstName, stationName string
 	err := db.QueryRow(
 		`SELECT u.id, u.otp_code, u.otp_expires_at, u.stream_key, u.first_name,
@@ -2117,6 +2256,7 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "code expired", http.StatusUnauthorized)
 		return
 	}
+	otpVerifyResetAttempts(body.Email)
 	_, _ = db.Exec(`UPDATE users SET is_email_verified = true, otp_code = '', otp_expires_at = '' WHERE id = $1`, userID)
 	token, err := jwtSign(userID, body.Email, stationName, "user")
 	if err != nil {
@@ -2167,6 +2307,12 @@ func handleResendOTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	if otpResendRateLimited(body.Email) {
+		// Still return 200 (don't leak account existence via a differing
+		// status code) — just skip sending another email so soon.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	otp, err := generateOTP()
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
@@ -2174,6 +2320,7 @@ func handleResendOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	exp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
 	_, _ = db.Exec(`UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`, otp, exp, userID)
+	otpVerifyResetAttempts(body.Email)
 	if err := sendOTPEmail(body.Email, firstName, otp); err != nil {
 		log.Printf("[email] resend OTP to %s: %v", body.Email, err)
 		http.Error(w, "failed to send verification email — please try again", http.StatusInternalServerError)
@@ -2439,116 +2586,6 @@ func handleListenerStatus(w http.ResponseWriter, r *http.Request) {
 		"status":     status,
 		"over_limit": overLimit,
 		"percentage": int(float64(current) / float64(limit) * 100),
-	})
-}
-
-// handleUpgradePlan updates the user's subscription plan and billing cycle
-// POST /api/user/upgrade {"plan": "professional", "billing_cycle": "monthly"}
-func handleUpgradePlan(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	userID := r.Context().Value(contextKeyUserID).(string)
-	email, _ := r.Context().Value(contextKeyEmail).(string)
-
-	var body struct {
-		Plan         string `json:"plan"`
-		BillingCycle string `json:"billing_cycle"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	body.Plan = strings.ToLower(strings.TrimSpace(body.Plan))
-	body.BillingCycle = strings.ToLower(strings.TrimSpace(body.BillingCycle))
-
-	var planExists bool
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM package_plans WHERE id = $1)`, body.Plan).Scan(&planExists); err != nil {
-		log.Printf("[upgrade] Error validating plan %q for user %s: %v", body.Plan, userID, err)
-		http.Error(w, "failed to validate plan", http.StatusInternalServerError)
-		return
-	}
-	if !planExists {
-		http.Error(w, "invalid plan", http.StatusBadRequest)
-		return
-	}
-
-	// Validate billing cycle
-	if body.BillingCycle != "monthly" && body.BillingCycle != "yearly" {
-		http.Error(w, "invalid billing cycle", http.StatusBadRequest)
-		return
-	}
-
-	if _, err := ensureStation(userID, email, "", ""); err != nil {
-		log.Printf("[upgrade] Error ensuring station for user %s: %v", userID, err)
-		http.Error(w, "failed to prepare station", http.StatusInternalServerError)
-		return
-	}
-
-	upgradeID, err := generateKey()
-	if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	var oldPlan, oldBillingCycle string
-	err = tx.QueryRow(`SELECT plan, billing_cycle FROM stations WHERE user_id = $1 FOR UPDATE`, userID).
-		Scan(&oldPlan, &oldBillingCycle)
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "station not found", http.StatusInternalServerError)
-		return
-	}
-	if err != nil {
-		log.Printf("[upgrade] Error loading current plan for user %s: %v", userID, err)
-		http.Error(w, "failed to load current plan", http.StatusInternalServerError)
-		return
-	}
-
-	result, err := tx.Exec(`UPDATE stations SET plan = $1, billing_cycle = $2 WHERE user_id = $3`,
-		body.Plan, body.BillingCycle, userID)
-	if err != nil {
-		log.Printf("[upgrade] Error updating plan for user %s: %v", userID, err)
-		http.Error(w, "failed to update plan", http.StatusInternalServerError)
-		return
-	}
-	rowsAffected, err := result.RowsAffected()
-	if err == nil && rowsAffected == 0 {
-		http.Error(w, "no station updated", http.StatusInternalServerError)
-		return
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO package_upgrade_history
-			(id, user_id, old_plan, new_plan, old_billing_cycle, new_billing_cycle, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, 'active')`,
-		upgradeID, userID, oldPlan, body.Plan, oldBillingCycle, body.BillingCycle,
-	); err != nil {
-		log.Printf("[upgrade] Error recording plan history for user %s: %v", userID, err)
-		http.Error(w, "failed to record upgrade", http.StatusInternalServerError)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("[upgrade] Error committing plan upgrade for user %s: %v", userID, err)
-		http.Error(w, "failed to update plan", http.StatusInternalServerError)
-		return
-	}
-
-	log.Printf("[upgrade] User %s changed plan from %s to %s (%s)", userID, oldPlan, body.Plan, body.BillingCycle)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":       true,
-		"upgrade_id":    upgradeID,
-		"old_plan":      oldPlan,
-		"plan":          body.Plan,
-		"billing_cycle": body.BillingCycle,
 	})
 }
 
@@ -2998,7 +3035,11 @@ func getDestinationsForKey(streamKey string) []string {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		if isAllowedOrigin(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
@@ -6339,6 +6380,7 @@ var (
 	paypalClientID      = os.Getenv("PAYPAL_CLIENT_ID")
 	paypalSecret        = os.Getenv("PAYPAL_SECRET")
 	paypalMode          = os.Getenv("PAYPAL_MODE") // "sandbox" or "live"
+	paypalWebhookID     = os.Getenv("PAYPAL_WEBHOOK_ID")
 	stripeSecretKey     = os.Getenv("STRIPE_SECRET_KEY")
 	stripeWebhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
 )
@@ -6376,6 +6418,115 @@ func getPayPalAccessToken() (string, error) {
 	}
 
 	return result.AccessToken, nil
+}
+
+// verifyPayPalWebhookSignature confirms an incoming webhook request was actually
+// sent by PayPal (not forged) by asking PayPal's own verification API to check the
+// transmission headers against the raw request body.
+func verifyPayPalWebhookSignature(r *http.Request, body []byte) bool {
+	if strings.TrimSpace(paypalWebhookID) == "" {
+		log.Printf("[paypal webhook] PAYPAL_WEBHOOK_ID not configured; rejecting webhook")
+		return false
+	}
+
+	transmissionID := r.Header.Get("Paypal-Transmission-Id")
+	transmissionTime := r.Header.Get("Paypal-Transmission-Time")
+	certURL := r.Header.Get("Paypal-Cert-Url")
+	authAlgo := r.Header.Get("Paypal-Auth-Algo")
+	transmissionSig := r.Header.Get("Paypal-Transmission-Sig")
+	if transmissionID == "" || transmissionTime == "" || certURL == "" || authAlgo == "" || transmissionSig == "" {
+		log.Printf("[paypal webhook] missing transmission headers")
+		return false
+	}
+
+	accessToken, err := getPayPalAccessToken()
+	if err != nil || strings.TrimSpace(accessToken) == "" {
+		log.Printf("[paypal webhook] failed to get access token for verification: %v", err)
+		return false
+	}
+
+	verifyReq := struct {
+		AuthAlgo         string          `json:"auth_algo"`
+		CertURL          string          `json:"cert_url"`
+		TransmissionID   string          `json:"transmission_id"`
+		TransmissionSig  string          `json:"transmission_sig"`
+		TransmissionTime string          `json:"transmission_time"`
+		WebhookID        string          `json:"webhook_id"`
+		WebhookEvent     json.RawMessage `json:"webhook_event"`
+	}{
+		AuthAlgo:         authAlgo,
+		CertURL:          certURL,
+		TransmissionID:   transmissionID,
+		TransmissionSig:  transmissionSig,
+		TransmissionTime: transmissionTime,
+		WebhookID:        paypalWebhookID,
+		WebhookEvent:     json.RawMessage(body),
+	}
+	payload, err := json.Marshal(verifyReq)
+	if err != nil {
+		log.Printf("[paypal webhook] failed to marshal verification request: %v", err)
+		return false
+	}
+
+	req, err := http.NewRequest("POST", getPayPalBaseURL()+"/v1/notifications/verify-webhook-signature", bytes.NewReader(payload))
+	if err != nil {
+		log.Printf("[paypal webhook] failed to build verification request: %v", err)
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		log.Printf("[paypal webhook] verification request failed: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		VerificationStatus string `json:"verification_status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("[paypal webhook] failed to decode verification response: %v", err)
+		return false
+	}
+
+	return resp.StatusCode == http.StatusOK && result.VerificationStatus == "SUCCESS"
+}
+
+// getPayPalSubscription fetches a subscription's live status and plan ID directly
+// from PayPal so callers never have to trust client-submitted subscription details.
+func getPayPalSubscription(subscriptionID string) (status string, planID string, err error) {
+	accessToken, err := getPayPalAccessToken()
+	if err != nil || strings.TrimSpace(accessToken) == "" {
+		return "", "", fmt.Errorf("failed to get PayPal access token: %w", err)
+	}
+
+	req, err := http.NewRequest("GET", getPayPalBaseURL()+"/v1/billing/subscriptions/"+url.PathEscape(subscriptionID), nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("PayPal subscription lookup failed (%d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Status string `json:"status"`
+		PlanID string `json:"plan_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", err
+	}
+	return result.Status, result.PlanID, nil
 }
 
 // handlePayPalCreateSubscription returns the PayPal plan ID for a subscription
@@ -6437,6 +6588,12 @@ func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "error reading body", http.StatusBadRequest)
+		return
+	}
+
+	if !verifyPayPalWebhookSignature(r, body) {
+		log.Printf("[paypal webhook] signature verification failed, rejecting request")
+		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
 		return
 	}
 
@@ -6574,6 +6731,43 @@ func handlePayPalSuccess(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid plan", http.StatusBadRequest)
 		return
 	}
+
+	// Look up the PayPal plan ID we expect for the claimed plan/billing cycle so
+	// we can confirm below that the subscription the client is reporting actually
+	// matches what they say they bought (not a cheaper plan's subscription ID).
+	var expectedPayPalPlanID string
+	planColumn := "paypal_plan_id_monthly"
+	if body.BillingCycle == "yearly" {
+		planColumn = "paypal_plan_id_yearly"
+	}
+	if err := db.QueryRow(`SELECT `+planColumn+` FROM package_plans WHERE id = $1`, body.Plan).Scan(&expectedPayPalPlanID); err != nil {
+		log.Printf("[paypal] Error loading expected PayPal plan ID for %s/%s user %s: %v", body.Plan, body.BillingCycle, userID, err)
+		http.Error(w, "failed to validate plan", http.StatusInternalServerError)
+		return
+	}
+
+	// Verify the subscription directly with PayPal rather than trusting the
+	// client-submitted subscription_id/plan — this is what stops a user from
+	// POSTing an arbitrary subscription ID and an expensive plan name to get
+	// upgraded without ever paying.
+	paypalStatus, paypalPlanID, err := getPayPalSubscription(subscriptionID)
+	if err != nil {
+		log.Printf("[paypal] Error verifying subscription %s for user %s: %v", subscriptionID, userID, err)
+		http.Error(w, "failed to verify subscription with PayPal", http.StatusBadGateway)
+		return
+	}
+	if paypalStatus != "ACTIVE" {
+		log.Printf("[paypal] Subscription %s for user %s is not active (status=%s)", subscriptionID, userID, paypalStatus)
+		http.Error(w, "subscription is not active", http.StatusPaymentRequired)
+		return
+	}
+	if strings.TrimSpace(expectedPayPalPlanID) == "" || paypalPlanID != expectedPayPalPlanID {
+		log.Printf("[paypal] Subscription %s plan mismatch for user %s: got %s, expected %s (%s/%s)",
+			subscriptionID, userID, paypalPlanID, expectedPayPalPlanID, body.Plan, body.BillingCycle)
+		http.Error(w, "subscription does not match requested plan", http.StatusBadRequest)
+		return
+	}
+
 	if _, err := ensureStation(userID, email, "", ""); err != nil {
 		log.Printf("[paypal] Error ensuring station for user %s: %v", userID, err)
 		http.Error(w, "failed to prepare station", http.StatusInternalServerError)
@@ -7811,6 +8005,48 @@ func handleScheduleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// isDisallowedProxyIP reports whether ip must not be reached by the scheduler
+// URL-stream proxy: loopback, private/internal ranges, and link-local
+// addresses (which includes the 169.254.169.254 cloud metadata endpoint).
+func isDisallowedProxyIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsMulticast()
+}
+
+// schedulerURLStreamClient fetches broadcaster-supplied external stream URLs
+// while refusing to connect to internal/private addresses. The check runs in
+// the dialer's Control hook, which fires with the literal IP the OS is about
+// to connect to (after DNS resolution) — this closes the DNS-rebinding gap a
+// simple pre-check of the hostname would leave open, and it re-runs for every
+// redirect the client follows since each one opens a new connection.
+var schedulerURLStreamClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control: func(_, address string, _ syscall.RawConn) error {
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					return err
+				}
+				ip := net.ParseIP(host)
+				if ip == nil || isDisallowedProxyIP(ip) {
+					return fmt.Errorf("refusing to dial disallowed address %q", host)
+				}
+				return nil
+			},
+		}).DialContext,
+	},
+}
+
 func handleSchedulerURLStream(w http.ResponseWriter, r *http.Request) {
 	// The <audio> element src cannot send Authorization headers, so accept the
 	// JWT as a ?token= query param (same pattern as /api/events).
@@ -7859,7 +8095,7 @@ func handleSchedulerURLStream(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("User-Agent", ua)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := schedulerURLStreamClient.Do(req)
 	if err != nil {
 		http.Error(w, "failed to fetch source audio", http.StatusBadGateway)
 		return
@@ -7983,7 +8219,6 @@ func main() {
 	// VIDEO DISABLED: RTMP multistream destination routes are not registered.
 	mux.HandleFunc("/api/user/profile", requireAuth(handleUserProfile))
 	mux.HandleFunc("/api/user/listener-status", requireAuth(handleListenerStatus))
-	mux.HandleFunc("/api/user/upgrade", requireAuth(handleUpgradePlan))
 	mux.HandleFunc("/api/user/password", requireAuth(handleChangePassword))
 	mux.HandleFunc("/api/user/account", requireAuth(handleDeleteAccount))
 	// VIDEO DISABLED: social-video OAuth routes are not registered.

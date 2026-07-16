@@ -10,8 +10,7 @@ import (
 var studioUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	// Configure securely for production
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return isAllowedOrigin(r.Header.Get("Origin")) },
 }
 
 func HandleStudioWebsocket(w http.ResponseWriter, r *http.Request) {
