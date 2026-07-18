@@ -3646,11 +3646,8 @@ func ffmpegStatusMessage(prefix string, err error, stderr *tailBuffer) string {
 	return msg
 }
 
-func sanitizePublicStationLiveState(userID string, isLive bool, icecastListenURL string) (bool, string) {
+func sanitizePublicStationLiveState(_ string, isLive bool, icecastListenURL string) (bool, string) {
 	if !isLive {
-		return false, ""
-	}
-	if icecastListenURL != "" && !liveEncoderSessions.isLive(userID) {
 		return false, ""
 	}
 	if strings.HasPrefix(icecastListenURL, "/icecast/") {
