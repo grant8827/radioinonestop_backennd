@@ -2673,6 +2673,106 @@ func handleStreamCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleEncoderAuthorize returns the server-controlled Icecast settings needed
+// by the dedicated encoder worker. Authentication is the user's normal bearer
+// token; the worker never needs the Railway JWT secret or database credentials.
+func handleEncoderAuthorize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID := r.Context().Value(contextKeyUserID).(string)
+	var body struct {
+		Bitrate string `json:"bitrate"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Bitrate = strings.TrimSpace(body.Bitrate)
+	if body.Bitrate == "" {
+		body.Bitrate = "96k"
+	}
+
+	var streamKey, sourcePassword, plan string
+	var suspended bool
+	err := db.QueryRow(`
+		SELECT u.stream_key, st.source_password, COALESCE(st.plan, 'starter'), COALESCE(st.is_suspended, false)
+		FROM users u
+		JOIN stations st ON st.user_id = u.id
+		WHERE u.id = $1
+	`, userID).Scan(&streamKey, &sourcePassword, &plan, &suspended)
+	if err != nil {
+		http.Error(w, "station not found", http.StatusNotFound)
+		return
+	}
+	if suspended {
+		http.Error(w, "station is suspended", http.StatusForbidden)
+		return
+	}
+	if !bitrateAllowedForPlan(plan, body.Bitrate) {
+		http.Error(w, fmt.Sprintf("%s bitrate is not available on the %s package", body.Bitrate, plan), http.StatusForbidden)
+		return
+	}
+	if shared := strings.TrimSpace(os.Getenv("ICECAST_SOURCE_PASSWORD")); shared != "" {
+		sourcePassword = shared
+	}
+	if streamKey == "" || sourcePassword == "" {
+		http.Error(w, "station encoder credentials are incomplete", http.StatusConflict)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"user_id":         userID,
+		"stream_key":      streamKey,
+		"source_password": sourcePassword,
+		"username":        "source",
+		"bitrate":         body.Bitrate,
+		"plan":            plan,
+	})
+}
+
+// handleEncoderSession lets the authenticated encoder worker publish the
+// current user's live state without giving the worker direct database access.
+// Public station reads still verify the Icecast mount before reporting it live.
+func handleEncoderSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID := r.Context().Value(contextKeyUserID).(string)
+	var body struct {
+		Live bool `json:"live"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if body.Live {
+		var streamKey string
+		if err := db.QueryRow(`SELECT stream_key FROM users WHERE id = $1`, userID).Scan(&streamKey); err != nil || streamKey == "" {
+			http.Error(w, "station not found", http.StatusNotFound)
+			return
+		}
+		_, err := db.Exec(`
+			UPDATE stations
+			SET is_live = true, last_connected_at = $1, icecast_listen_url = $2
+			WHERE user_id = $3
+		`, time.Now().UTC().Format(time.RFC3339), publicIcecastListenURL(streamKey), userID)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		if _, err := db.Exec(`UPDATE stations SET is_live = false, icecast_listen_url = '' WHERE user_id = $1`, userID); err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleGetCredentials returns the current user's stream key, ingest URL,
 // and saved external platform destinations.
 func handleGetCredentials(w http.ResponseWriter, r *http.Request) {
@@ -8215,6 +8315,8 @@ func main() {
 	mux.HandleFunc("/api/auth/reset-password", handleResetPassword)
 	mux.HandleFunc("/api/auth/", handleOAuthRoute) // platform OAuth connect + callback
 	mux.HandleFunc("/api/user/stream-credentials", requireAuth(handleStreamCredentials))
+	mux.HandleFunc("/api/user/encoder-authorize", requireAuth(handleEncoderAuthorize))
+	mux.HandleFunc("/api/user/encoder-session", requireAuth(handleEncoderSession))
 	mux.HandleFunc("/api/schedules", requireAuth(handleSchedules))
 	mux.HandleFunc("/api/schedules/", requireAuth(handleScheduleByID))
 	mux.HandleFunc("/api/scheduler/url-stream", handleSchedulerURLStream)
