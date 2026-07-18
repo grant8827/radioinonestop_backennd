@@ -8243,15 +8243,10 @@ func main() {
 	}
 	log.Printf("[db] Connected to PostgreSQL")
 
-	// Process restarts tear down active encoders; clear stale live/mount state
-	// so the frontend does not keep trying dead Icecast URLs.
-	if _, err := db.Exec(`UPDATE stations
-		SET is_live = false,
-		    current_listeners_count = 0,
-		    icecast_listen_url = ''
-		WHERE is_live = true OR current_listeners_count <> 0 OR icecast_listen_url <> ''`); err != nil {
-		log.Printf("[db] stale live-state cleanup warning: %v", err)
-	}
+	// Do not clear station live state here. Browser encoders can run on the
+	// dedicated DigitalOcean worker and must survive Railway API redeploys.
+	// Public station reads already verify the real Icecast mount and clear stale
+	// state when a source is no longer present.
 
 	// JWT secret — use JWT_SECRET env var or generate ephemeral secret.
 	if secret := os.Getenv("JWT_SECRET"); secret != "" {
