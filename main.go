@@ -7677,8 +7677,8 @@ func handleSupportMessages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "select a valid reason", http.StatusBadRequest)
 		return
 	}
-	if len(body.Station) > 300 || (body.Reason == "station_not_streaming" && body.Station == "") {
-		http.Error(w, "enter the station name or station URL", http.StatusBadRequest)
+	if body.Station == "" || len(body.Station) > 300 {
+		http.Error(w, "enter the station name", http.StatusBadRequest)
 		return
 	}
 	if len(body.Message) < 10 || len(body.Message) > 4000 {
