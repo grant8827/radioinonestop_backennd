@@ -526,6 +526,7 @@ func initDB(dsn string) error {
 			email TEXT NOT NULL,
 			reason TEXT NOT NULL,
 			message TEXT NOT NULL,
+			station TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'open',
 			admin_reply TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -535,6 +536,7 @@ func initDB(dsn string) error {
 	if err != nil {
 		return err
 	}
+	_, _ = db.Exec(`ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS station TEXT NOT NULL DEFAULT ''`)
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS destinations (
 			id         TEXT PRIMARY KEY,
@@ -7657,7 +7659,7 @@ func handleSupportMessages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var body struct{ Email, Reason, Message string }
+	var body struct{ Email, Reason, Station, Message string }
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
@@ -7665,6 +7667,7 @@ func handleSupportMessages(w http.ResponseWriter, r *http.Request) {
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
 	body.Reason = strings.TrimSpace(body.Reason)
 	body.Message = strings.TrimSpace(body.Message)
+	body.Station = strings.TrimSpace(body.Station)
 	address, err := mail.ParseAddress(body.Email)
 	if err != nil || address.Address != body.Email {
 		http.Error(w, "enter a valid email address", http.StatusBadRequest)
@@ -7672,6 +7675,10 @@ func handleSupportMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	if !supportReasons[body.Reason] {
 		http.Error(w, "select a valid reason", http.StatusBadRequest)
+		return
+	}
+	if len(body.Station) > 300 || (body.Reason == "station_not_streaming" && body.Station == "") {
+		http.Error(w, "enter the station name or station URL", http.StatusBadRequest)
 		return
 	}
 	if len(body.Message) < 10 || len(body.Message) > 4000 {
@@ -7683,7 +7690,7 @@ func handleSupportMessages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	if _, err = db.Exec(`INSERT INTO support_messages (id, email, reason, message) VALUES ($1,$2,$3,$4)`, id, body.Email, body.Reason, body.Message); err != nil {
+	if _, err = db.Exec(`INSERT INTO support_messages (id, email, reason, station, message) VALUES ($1,$2,$3,$4,$5)`, id, body.Email, body.Reason, body.Station, body.Message); err != nil {
 		log.Printf("[support] create message: %v", err)
 		http.Error(w, "could not send message", http.StatusInternalServerError)
 		return
@@ -7695,7 +7702,7 @@ func handleSupportMessages(w http.ResponseWriter, r *http.Request) {
 
 func handleAdminSupport(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		rows, err := db.Query(`SELECT id,email,reason,message,status,admin_reply,created_at::text,COALESCE(replied_at::text,'') FROM support_messages ORDER BY created_at DESC`)
+		rows, err := db.Query(`SELECT id,email,reason,station,message,status,admin_reply,created_at::text,COALESCE(replied_at::text,'') FROM support_messages ORDER BY created_at DESC`)
 		if err != nil {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
@@ -7705,6 +7712,7 @@ func handleAdminSupport(w http.ResponseWriter, r *http.Request) {
 			ID         string `json:"id"`
 			Email      string `json:"email"`
 			Reason     string `json:"reason"`
+			Station    string `json:"station"`
 			Message    string `json:"message"`
 			Status     string `json:"status"`
 			AdminReply string `json:"adminReply"`
@@ -7714,7 +7722,7 @@ func handleAdminSupport(w http.ResponseWriter, r *http.Request) {
 		items := []item{}
 		for rows.Next() {
 			var x item
-			if rows.Scan(&x.ID, &x.Email, &x.Reason, &x.Message, &x.Status, &x.AdminReply, &x.CreatedAt, &x.RepliedAt) == nil {
+			if rows.Scan(&x.ID, &x.Email, &x.Reason, &x.Station, &x.Message, &x.Status, &x.AdminReply, &x.CreatedAt, &x.RepliedAt) == nil {
 				items = append(items, x)
 			}
 		}
