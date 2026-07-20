@@ -33,6 +33,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -514,6 +515,21 @@ func initDB(dsn string) error {
 			stream_key    TEXT UNIQUE NOT NULL,
 			role          TEXT NOT NULL DEFAULT 'user',
 			created_at    TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS support_messages (
+			id TEXT PRIMARY KEY,
+			email TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			message TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'open',
+			admin_reply TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			replied_at TIMESTAMPTZ
 		)
 	`)
 	if err != nil {
@@ -7631,6 +7647,117 @@ func handleAdminPayPalSyncPlans(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var supportReasons = map[string]bool{
+	"pricing": true, "station_not_streaming": true, "account": true, "technical": true, "other": true,
+}
+
+// handleSupportMessages accepts messages from visitors and signed-in users.
+func handleSupportMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct{ Email, Reason, Message string }
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+	body.Reason = strings.TrimSpace(body.Reason)
+	body.Message = strings.TrimSpace(body.Message)
+	address, err := mail.ParseAddress(body.Email)
+	if err != nil || address.Address != body.Email {
+		http.Error(w, "enter a valid email address", http.StatusBadRequest)
+		return
+	}
+	if !supportReasons[body.Reason] {
+		http.Error(w, "select a valid reason", http.StatusBadRequest)
+		return
+	}
+	if len(body.Message) < 10 || len(body.Message) > 4000 {
+		http.Error(w, "message must be between 10 and 4000 characters", http.StatusBadRequest)
+		return
+	}
+	id, err := generateKey()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if _, err = db.Exec(`INSERT INTO support_messages (id, email, reason, message) VALUES ($1,$2,$3,$4)`, id, body.Email, body.Reason, body.Message); err != nil {
+		log.Printf("[support] create message: %v", err)
+		http.Error(w, "could not send message", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "sent"})
+}
+
+func handleAdminSupport(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		rows, err := db.Query(`SELECT id,email,reason,message,status,admin_reply,created_at::text,COALESCE(replied_at::text,'') FROM support_messages ORDER BY created_at DESC`)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		type item struct {
+			ID         string `json:"id"`
+			Email      string `json:"email"`
+			Reason     string `json:"reason"`
+			Message    string `json:"message"`
+			Status     string `json:"status"`
+			AdminReply string `json:"adminReply"`
+			CreatedAt  string `json:"createdAt"`
+			RepliedAt  string `json:"repliedAt"`
+		}
+		items := []item{}
+		for rows.Next() {
+			var x item
+			if rows.Scan(&x.ID, &x.Email, &x.Reason, &x.Message, &x.Status, &x.AdminReply, &x.CreatedAt, &x.RepliedAt) == nil {
+				items = append(items, x)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(items)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		ID    string `json:"id"`
+		Reply string `json:"reply"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body) != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Reply = strings.TrimSpace(body.Reply)
+	if body.ID == "" || len(body.Reply) < 1 || len(body.Reply) > 4000 {
+		http.Error(w, "a reply is required", http.StatusBadRequest)
+		return
+	}
+	var email, original string
+	if err := db.QueryRow(`SELECT email,message FROM support_messages WHERE id=$1`, body.ID).Scan(&email, &original); err != nil {
+		http.Error(w, "message not found", http.StatusNotFound)
+		return
+	}
+	content := fmt.Sprintf(`<h2 style="margin:0 0 16px;color:white;font-size:20px;">Reply from Radio In One Stop</h2><p style="color:#d1d5db;line-height:1.7;white-space:pre-wrap;">%s</p><hr style="border:0;border-top:1px solid #374151;margin:24px 0;"><p style="color:#6b7280;font-size:13px;">Your original message:</p><p style="color:#9ca3af;font-size:13px;line-height:1.6;white-space:pre-wrap;">%s</p>`, html.EscapeString(body.Reply), html.EscapeString(original))
+	if err := sendMail(email, "Reply to your Radio In One Stop message", emailBase("Support reply", "We replied to your message", content)); err != nil {
+		log.Printf("[support] reply email to %s: %v", email, err)
+		http.Error(w, "email could not be sent", http.StatusBadGateway)
+		return
+	}
+	if _, err := db.Exec(`UPDATE support_messages SET admin_reply=$1,status='replied',replied_at=NOW() WHERE id=$2`, body.Reply, body.ID); err != nil {
+		http.Error(w, "reply sent but status could not be saved", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
 // handleAdminMarketing - GET/PUT marketing content for public pages
 func handleAdminMarketing(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -8341,6 +8468,7 @@ func main() {
 
 	// ── Public API (no auth required) ────────────────────────────────────────
 	mux.HandleFunc("/api/public/pricing", handlePublicPricing)
+	mux.HandleFunc("/api/support/messages", handleSupportMessages)
 
 	// ── PayPal Subscription API ───────────────────────────────────────────────
 	mux.HandleFunc("/api/paypal/create-subscription", requireAuth(handlePayPalCreateSubscription))
@@ -8358,6 +8486,7 @@ func main() {
 	mux.HandleFunc("/api/admin/pricing", requireAdmin(handleAdminPricing))
 	mux.HandleFunc("/api/admin/paypal/sync-plans", requireAdmin(handleAdminPayPalSyncPlans))
 	mux.HandleFunc("/api/admin/marketing", requireAdmin(handleAdminMarketing))
+	mux.HandleFunc("/api/admin/support", requireAdmin(handleAdminSupport))
 
 	// HLS static file handler (serves /hls/<streamKey>/index.m3u8 etc.)
 	mux.HandleFunc("/hls/", hlsHandler)
