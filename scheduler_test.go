@@ -34,3 +34,9 @@ func TestValidRecurrence(t *testing.T) {
 		t.Fatal("hourly recurrence should be rejected")
 	}
 }
+
+func TestSchedulerURLStreamClientHasNoWholeRequestTimeout(t *testing.T) {
+	if schedulerURLStreamClient.Timeout != 0 {
+		t.Fatalf("scheduler URL streams must not have a whole-request timeout; got %s", schedulerURLStreamClient.Timeout)
+	}
+}

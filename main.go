@@ -8262,7 +8262,6 @@ func isDisallowedProxyIP(ip net.IP) bool {
 // simple pre-check of the hostname would leave open, and it re-runs for every
 // redirect the client follows since each one opens a new connection.
 var schedulerURLStreamClient = &http.Client{
-	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -8279,6 +8278,7 @@ var schedulerURLStreamClient = &http.Client{
 				return nil
 			},
 		}).DialContext,
+		ResponseHeaderTimeout: 15 * time.Second,
 	},
 }
 
@@ -8342,6 +8342,9 @@ func handleSchedulerURLStream(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set(header, value)
 		}
 	}
+	// URL sources can be live radio streams with no natural end. Tell reverse
+	// proxies to forward audio chunks immediately instead of buffering them.
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
