@@ -36,6 +36,7 @@ import (
 	"html"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/mail"
@@ -7100,7 +7101,7 @@ func handleStripeCreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
 	} else if monthlySale > 0 && monthlySale < 100 {
 		effectivePrice = monthlyPrice * (1 - float64(monthlySale)/100.0)
 	}
-	unitAmount := int64(effectivePrice * 100)
+	unitAmount := int64(math.Round(effectivePrice * 100))
 	if unitAmount <= 0 {
 		http.Error(w, "invalid plan price", http.StatusBadRequest)
 		return
@@ -7536,8 +7537,9 @@ func createPayPalPlan(productID, name, description string, priceUSD float64, int
 	return result.ID, nil
 }
 
-// handleAdminPayPalSyncPlans creates/updates PayPal subscription plans for every package_plan
-// row and saves the resulting plan IDs back to the database.
+// handleAdminPayPalSyncPlans creates replacement PayPal subscription plans for
+// every package_plan and saves the new plan IDs back to the database. PayPal plan
+// prices are immutable, so replacing them is required after a price or sale change.
 func handleAdminPayPalSyncPlans(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -7605,7 +7607,7 @@ func handleAdminPayPalSyncPlans(w http.ResponseWriter, r *http.Request) {
 			effectiveYearly = yearlyPrice * (1 - float64(yearlySale)/100.0)
 		}
 
-		if existingMonthly == "" && effectiveMonthly > 0 {
+		if effectiveMonthly > 0 {
 			planID, err := createPayPalPlan(productID, name+" (Monthly)", name+" plan billed monthly", effectiveMonthly, "MONTH")
 			if err != nil {
 				res.Status = "error"
@@ -7617,7 +7619,7 @@ func handleAdminPayPalSyncPlans(w http.ResponseWriter, r *http.Request) {
 				_, _ = db.Exec(`UPDATE package_plans SET paypal_plan_id_monthly = $1 WHERE id = $2`, planID, id)
 			}
 		}
-		if existingYearly == "" && effectiveYearly > 0 {
+		if effectiveYearly > 0 {
 			planID, err := createPayPalPlan(productID, name+" (Yearly)", name+" plan billed yearly", effectiveYearly, "YEAR")
 			if err != nil {
 				if res.Status != "error" {
