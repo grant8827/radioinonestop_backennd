@@ -667,6 +667,9 @@ func initDB(dsn string) error {
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS paypal_subscription_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS trial_used BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ`,
+		`ALTER TABLE stations ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_email_verified BOOLEAN NOT NULL DEFAULT false`,
@@ -2441,6 +2444,20 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// expireTrialIfNeeded makes an expired unpaid trial use the same account gate
+// as other suspended stations. Paid subscriptions are never expired by this.
+func expireTrialIfNeeded(userID string) {
+	_, _ = db.Exec(`
+		UPDATE stations
+		SET is_suspended = true
+		WHERE user_id = $1
+		  AND trial_ends_at IS NOT NULL
+		  AND trial_ends_at <= NOW()
+		  AND COALESCE(paypal_subscription_id, '') = ''
+		  AND COALESCE(stripe_subscription_id, '') = ''
+	`, userID)
+}
+
 // handleUserProfile dispatches GET/PUT on /api/user/profile.
 func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(contextKeyUserID).(string)
@@ -2448,12 +2465,25 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		expireTrialIfNeeded(userID)
 		var firstName, lastName string
 		_ = db.QueryRow(`SELECT first_name, last_name FROM users WHERE id = $1`, userID).Scan(&firstName, &lastName)
 		var stationName, genre, description, logoURL, stationSlug, plan, billingCycle string
+		var paypalSubscriptionID, stripeSubscriptionID string
 		var isSuspended bool
-		_ = db.QueryRow(`SELECT station_name, genre, description, logo_url, station_slug, plan, billing_cycle, is_suspended FROM stations WHERE user_id = $1`, userID).
-			Scan(&stationName, &genre, &description, &logoURL, &stationSlug, &plan, &billingCycle, &isSuspended)
+		var trialUsed bool
+		var trialStartedAt, trialEndsAt sql.NullTime
+		_ = db.QueryRow(`
+			SELECT station_name, genre, description, logo_url, station_slug, plan,
+			       billing_cycle, is_suspended, trial_used, trial_started_at, trial_ends_at,
+			       paypal_subscription_id, stripe_subscription_id
+			FROM stations WHERE user_id = $1
+		`, userID).Scan(&stationName, &genre, &description, &logoURL, &stationSlug,
+			&plan, &billingCycle, &isSuspended, &trialUsed, &trialStartedAt, &trialEndsAt,
+			&paypalSubscriptionID, &stripeSubscriptionID)
+		trialActive := trialEndsAt.Valid && trialEndsAt.Time.After(time.Now())
+		paymentRequired := trialEndsAt.Valid && !trialActive &&
+			paypalSubscriptionID == "" && stripeSubscriptionID == ""
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"email":         email,
@@ -2467,6 +2497,21 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 			"plan":          plan,
 			"billing_cycle": billingCycle,
 			"is_suspended":  isSuspended,
+			"trial_used":    trialUsed,
+			"trial_active":  trialActive,
+			"trial_started_at": func() interface{} {
+				if trialStartedAt.Valid {
+					return trialStartedAt.Time
+				}
+				return nil
+			}(),
+			"trial_ends_at": func() interface{} {
+				if trialEndsAt.Valid {
+					return trialEndsAt.Time
+				}
+				return nil
+			}(),
+			"payment_required": paymentRequired,
 		})
 
 	case http.MethodPut:
@@ -2701,6 +2746,7 @@ func handleEncoderAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := r.Context().Value(contextKeyUserID).(string)
+	expireTrialIfNeeded(userID)
 	var body struct {
 		Bitrate string `json:"bitrate"`
 	}
@@ -6201,7 +6247,10 @@ func getAllUsers(w http.ResponseWriter, r *http.Request) {
 			COALESCE(s.station_name, ''),
 			COALESCE(s.plan, 'starter'),
 			COALESCE(s.billing_cycle, 'monthly'),
-			COALESCE(s.is_suspended, false)
+			COALESCE(s.is_suspended, false),
+			COALESCE(s.trial_used, false),
+			s.trial_started_at,
+			s.trial_ends_at
 		FROM users u
 		LEFT JOIN stations s ON u.id = s.user_id
 		ORDER BY u.created_at DESC
@@ -6214,14 +6263,17 @@ func getAllUsers(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type User struct {
-		ID           string `json:"id"`
-		Email        string `json:"email"`
-		Role         string `json:"role"`
-		CreatedAt    string `json:"createdAt"`
-		StationName  string `json:"stationName"`
-		Plan         string `json:"plan"`
-		BillingCycle string `json:"billingCycle"`
-		IsSuspended  bool   `json:"isSuspended"`
+		ID             string     `json:"id"`
+		Email          string     `json:"email"`
+		Role           string     `json:"role"`
+		CreatedAt      string     `json:"createdAt"`
+		StationName    string     `json:"stationName"`
+		Plan           string     `json:"plan"`
+		BillingCycle   string     `json:"billingCycle"`
+		IsSuspended    bool       `json:"isSuspended"`
+		TrialUsed      bool       `json:"trialUsed"`
+		TrialStartedAt *time.Time `json:"trialStartedAt"`
+		TrialEndsAt    *time.Time `json:"trialEndsAt"`
 	}
 
 	var users []User
@@ -6229,7 +6281,8 @@ func getAllUsers(w http.ResponseWriter, r *http.Request) {
 		var u User
 
 		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &u.CreatedAt,
-			&u.StationName, &u.Plan, &u.BillingCycle, &u.IsSuspended); err != nil {
+			&u.StationName, &u.Plan, &u.BillingCycle, &u.IsSuspended,
+			&u.TrialUsed, &u.TrialStartedAt, &u.TrialEndsAt); err != nil {
 			log.Printf("[admin] Error scanning user row: %v", err)
 			continue
 		}
@@ -6277,6 +6330,7 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 		Plan         string `json:"plan"`
 		BillingCycle string `json:"billingCycle"`
 		IsSuspended  *bool  `json:"isSuspended"`
+		StartTrial   bool   `json:"startTrial"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -6317,6 +6371,38 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 	if _, err := ensureStation(userID, email, "", ""); err != nil {
 		log.Printf("[admin] Error ensuring station for user %s: %v", userID, err)
 		http.Error(w, "failed to prepare station", http.StatusInternalServerError)
+		return
+	}
+
+	if body.StartTrial {
+		result, err := db.Exec(`
+			UPDATE stations
+			SET plan = $1,
+			    billing_cycle = $2,
+			    is_suspended = false,
+			    trial_used = true,
+			    trial_started_at = NOW(),
+			    trial_ends_at = NOW() + INTERVAL '30 days'
+			WHERE user_id = $3
+			  AND trial_used = false
+			  AND COALESCE(paypal_subscription_id, '') = ''
+			  AND COALESCE(stripe_subscription_id, '') = ''
+		`, body.Plan, body.BillingCycle, userID)
+		if err != nil {
+			log.Printf("[admin] Error starting trial for user %s: %v", userID, err)
+			http.Error(w, "failed to start trial", http.StatusInternalServerError)
+			return
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 0 {
+			http.Error(w, "trial already used or account already has a paid subscription", http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "30-day trial started successfully",
+		})
 		return
 	}
 
@@ -6745,7 +6831,8 @@ func handlePayPalWebhook(w http.ResponseWriter, r *http.Request) {
 		// Activate subscription
 		_, err := db.Exec(`
 			UPDATE stations
-			SET paypal_subscription_id = $1, is_suspended = false
+			SET paypal_subscription_id = $1, is_suspended = false,
+			    trial_started_at = NULL, trial_ends_at = NULL
 			WHERE user_id = (SELECT id FROM users WHERE email = $2)
 		`, subscriptionID, email)
 		if err != nil {
@@ -6916,7 +7003,8 @@ func handlePayPalSuccess(w http.ResponseWriter, r *http.Request) {
 	// Update station with PayPal subscription ID and active plan
 	_, err = tx.Exec(`
 		UPDATE stations 
-		SET paypal_subscription_id = $1, is_suspended = false, plan = $2, billing_cycle = $3
+		SET paypal_subscription_id = $1, is_suspended = false, plan = $2, billing_cycle = $3,
+		    trial_started_at = NULL, trial_ends_at = NULL
 		WHERE user_id = $4
 	`, subscriptionID, body.Plan, body.BillingCycle, userID)
 
@@ -7291,7 +7379,8 @@ func handleStripeSuccess(w http.ResponseWriter, r *http.Request) {
 
 	_, err = tx.Exec(`
 		UPDATE stations
-		SET stripe_subscription_id = $1, is_suspended = false, plan = $2, billing_cycle = $3
+		SET stripe_subscription_id = $1, is_suspended = false, plan = $2, billing_cycle = $3,
+		    trial_started_at = NULL, trial_ends_at = NULL
 		WHERE user_id = $4
 	`, subscriptionID, plan, billingCycle, userID)
 	if err != nil {
@@ -7380,7 +7469,9 @@ func handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 				SET stripe_subscription_id = $1,
 				    is_suspended = false,
 				    plan = CASE WHEN $2 <> '' THEN $2 ELSE plan END,
-				    billing_cycle = CASE WHEN $3 <> '' THEN $3 ELSE billing_cycle END
+				    billing_cycle = CASE WHEN $3 <> '' THEN $3 ELSE billing_cycle END,
+				    trial_started_at = NULL,
+				    trial_ends_at = NULL
 				WHERE user_id = $4
 			`, subscriptionID, plan, billingCycle, obj.ClientReferenceID)
 		}
