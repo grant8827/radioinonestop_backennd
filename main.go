@@ -737,6 +737,7 @@ func initDB(dsn string) error {
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT false`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS paypal_plan_id_monthly TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS paypal_plan_id_yearly TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE package_plans ADD COLUMN IF NOT EXISTS trial_enabled BOOLEAN NOT NULL DEFAULT false`)
 
 	// Sync pricing data to new columns
 	_, _ = db.Exec(`
@@ -6330,7 +6331,6 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 		Plan         string `json:"plan"`
 		BillingCycle string `json:"billingCycle"`
 		IsSuspended  *bool  `json:"isSuspended"`
-		StartTrial   bool   `json:"startTrial"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -6374,38 +6374,6 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if body.StartTrial {
-		result, err := db.Exec(`
-			UPDATE stations
-			SET plan = $1,
-			    billing_cycle = $2,
-			    is_suspended = false,
-			    trial_used = true,
-			    trial_started_at = NOW(),
-			    trial_ends_at = NOW() + INTERVAL '30 days'
-			WHERE user_id = $3
-			  AND trial_used = false
-			  AND COALESCE(paypal_subscription_id, '') = ''
-			  AND COALESCE(stripe_subscription_id, '') = ''
-		`, body.Plan, body.BillingCycle, userID)
-		if err != nil {
-			log.Printf("[admin] Error starting trial for user %s: %v", userID, err)
-			http.Error(w, "failed to start trial", http.StatusInternalServerError)
-			return
-		}
-		affected, _ := result.RowsAffected()
-		if affected == 0 {
-			http.Error(w, "trial already used or account already has a paid subscription", http.StatusConflict)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"message": "30-day trial started successfully",
-		})
-		return
-	}
-
 	// Update station plan and suspension status
 	_, err := db.Exec(`
 		UPDATE stations 
@@ -6438,10 +6406,68 @@ func handleAdminPricing(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleStartPackageTrial activates a one-time 30-day trial only when the
+// selected package has been enabled for trials by Super Admin.
+func handleStartPackageTrial(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.Context().Value(contextKeyUserID).(string)
+	var body struct {
+		Plan         string `json:"plan"`
+		BillingCycle string `json:"billing_cycle"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Plan = strings.ToLower(strings.TrimSpace(body.Plan))
+	body.BillingCycle = strings.ToLower(strings.TrimSpace(body.BillingCycle))
+	if body.BillingCycle != "monthly" && body.BillingCycle != "yearly" {
+		body.BillingCycle = "monthly"
+	}
+
+	result, err := db.Exec(`
+		UPDATE stations
+		SET plan = $1,
+		    billing_cycle = $2,
+		    is_suspended = false,
+		    trial_used = true,
+		    trial_started_at = NOW(),
+		    trial_ends_at = NOW() + INTERVAL '30 days'
+		WHERE user_id = $3
+		  AND trial_used = false
+		  AND COALESCE(paypal_subscription_id, '') = ''
+		  AND COALESCE(stripe_subscription_id, '') = ''
+		  AND EXISTS (
+			  SELECT 1 FROM package_plans
+			  WHERE id = $1 AND trial_enabled = true
+		  )
+	`, body.Plan, body.BillingCycle, userID)
+	if err != nil {
+		log.Printf("[trial] Error starting package trial for user %s: %v", userID, err)
+		http.Error(w, "failed to start trial", http.StatusInternalServerError)
+		return
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		http.Error(w, "free trial is unavailable for this package or has already been used", http.StatusConflict)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"trial_ends_at": time.Now().Add(30 * 24 * time.Hour),
+	})
+}
+
 func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT id, name, monthly_price, yearly_price, features, monthly_sale_percent, yearly_sale_percent, is_featured, 
-		       paypal_plan_id_monthly, paypal_plan_id_yearly
+		SELECT id, name, monthly_price, yearly_price, features, monthly_sale_percent, yearly_sale_percent, is_featured,
+		       paypal_plan_id_monthly, paypal_plan_id_yearly, trial_enabled
 		FROM package_plans
 		ORDER BY monthly_price ASC
 	`)
@@ -6463,6 +6489,7 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 		IsFeatured          bool     `json:"isFeatured"`
 		PayPalPlanIDMonthly string   `json:"paypalPlanIdMonthly"`
 		PayPalPlanIDYearly  string   `json:"paypalPlanIdYearly"`
+		TrialEnabled        bool     `json:"trialEnabled"`
 	}
 
 	var plans []PackagePlan
@@ -6471,7 +6498,7 @@ func getAdminPricing(w http.ResponseWriter, r *http.Request) {
 		var featuresJSON []byte
 		if err := rows.Scan(&p.ID, &p.Name, &p.MonthlyPrice, &p.YearlyPrice,
 			&featuresJSON, &p.MonthlySalePercent, &p.YearlySalePercent, &p.IsFeatured,
-			&p.PayPalPlanIDMonthly, &p.PayPalPlanIDYearly); err != nil {
+			&p.PayPalPlanIDMonthly, &p.PayPalPlanIDYearly, &p.TrialEnabled); err != nil {
 			continue
 		}
 		json.Unmarshal(featuresJSON, &p.Features)
@@ -6497,6 +6524,7 @@ func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
 		IsFeatured          bool     `json:"isFeatured"`
 		PayPalPlanIDMonthly string   `json:"paypalPlanIdMonthly"`
 		PayPalPlanIDYearly  string   `json:"paypalPlanIdYearly"`
+		TrialEnabled        bool     `json:"trialEnabled"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -6510,11 +6538,11 @@ func updateAdminPricing(w http.ResponseWriter, r *http.Request) {
 		UPDATE package_plans
 		SET monthly_price = $1, yearly_price = $2, features = $3, 
 		    monthly_sale_percent = $4, yearly_sale_percent = $5, is_featured = $6,
-		    paypal_plan_id_monthly = $7, paypal_plan_id_yearly = $8
-		WHERE id = $9
+		    paypal_plan_id_monthly = $7, paypal_plan_id_yearly = $8, trial_enabled = $9
+		WHERE id = $10
 	`, body.MonthlyPrice, body.YearlyPrice, featuresJSON,
 		body.MonthlySalePercent, body.YearlySalePercent, body.IsFeatured,
-		body.PayPalPlanIDMonthly, body.PayPalPlanIDYearly, body.ID)
+		body.PayPalPlanIDMonthly, body.PayPalPlanIDYearly, body.TrialEnabled, body.ID)
 
 	if err != nil {
 		log.Printf("[admin] Error updating pricing: %v", err)
@@ -6537,7 +6565,7 @@ func handlePublicPricing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-		SELECT id, name, monthly_price, yearly_price, features, monthly_sale_percent, yearly_sale_percent, is_featured
+		SELECT id, name, monthly_price, yearly_price, features, monthly_sale_percent, yearly_sale_percent, is_featured, trial_enabled
 		FROM package_plans
 		ORDER BY monthly_price ASC
 	`)
@@ -6557,6 +6585,7 @@ func handlePublicPricing(w http.ResponseWriter, r *http.Request) {
 		MonthlySalePercent int      `json:"monthlySalePercent"`
 		YearlySalePercent  int      `json:"yearlySalePercent"`
 		IsFeatured         bool     `json:"isFeatured"`
+		TrialEnabled       bool     `json:"trialEnabled"`
 	}
 
 	var plans []PackagePlan
@@ -6564,7 +6593,8 @@ func handlePublicPricing(w http.ResponseWriter, r *http.Request) {
 		var p PackagePlan
 		var featuresJSON []byte
 		if err := rows.Scan(&p.ID, &p.Name, &p.MonthlyPrice, &p.YearlyPrice,
-			&featuresJSON, &p.MonthlySalePercent, &p.YearlySalePercent, &p.IsFeatured); err != nil {
+			&featuresJSON, &p.MonthlySalePercent, &p.YearlySalePercent, &p.IsFeatured,
+			&p.TrialEnabled); err != nil {
 			continue
 		}
 		json.Unmarshal(featuresJSON, &p.Features)
@@ -8573,6 +8603,7 @@ func main() {
 	// ── Public API (no auth required) ────────────────────────────────────────
 	mux.HandleFunc("/api/public/pricing", handlePublicPricing)
 	mux.HandleFunc("/api/support/messages", handleSupportMessages)
+	mux.HandleFunc("/api/trial/start", requireAuth(handleStartPackageTrial))
 
 	// ── PayPal Subscription API ───────────────────────────────────────────────
 	mux.HandleFunc("/api/paypal/create-subscription", requireAuth(handlePayPalCreateSubscription))
