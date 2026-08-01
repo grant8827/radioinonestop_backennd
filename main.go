@@ -2711,6 +2711,14 @@ func expireTrialIfNeeded(userID string) {
 	`, userID)
 }
 
+func ensureStationProfileRow(userID, email, stationName, logoURL string) error {
+	if userID == "" || email == "" {
+		return nil
+	}
+	_, err := ensureStationWithDB(db, userID, email, stationName, logoURL)
+	return err
+}
+
 // handleUserProfile dispatches GET/PUT on /api/user/profile.
 func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(contextKeyUserID).(string)
@@ -2718,6 +2726,9 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		if err := ensureStationProfileRow(userID, email, "", ""); err != nil {
+			log.Printf("[profile] ensure station row for user %s failed: %v", userID, err)
+		}
 		expireTrialIfNeeded(userID)
 		var firstName, lastName string
 		_ = db.QueryRow(`SELECT first_name, last_name FROM users WHERE id = $1`, userID).Scan(&firstName, &lastName)
@@ -2810,6 +2821,11 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "station name already taken", http.StatusConflict)
 				return
 			}
+		}
+		if err := ensureStationProfileRow(userID, email, newStationName, body.LogoURL); err != nil {
+			log.Printf("[profile] ensure station row for user %s failed: %v", userID, err)
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
 		}
 		if _, err := db.Exec(
 			`UPDATE stations SET station_name = $1, genre = $2, description = $3, logo_url = $4 WHERE user_id = $5`,
@@ -3464,6 +3480,18 @@ func corsMiddleware(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[panic] %s %s: %v", r.Method, r.URL.Path, rec)
+				http.Error(w, "server error", http.StatusInternalServerError)
+			}
+		}()
 		next.ServeHTTP(w, r)
 	})
 }
@@ -8895,5 +8923,5 @@ func main() {
 
 	log.Printf("[http] Listening on :%s  (HLS dir: %s)", port, HLSDir)
 	log.Printf("[http] RTMP ingest: rtmp://localhost:%s/live/<streamKey>", RTMPPort)
-	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(mux)))
+	log.Fatal(http.ListenAndServe(":"+port, recoverMiddleware(corsMiddleware(mux))))
 }
