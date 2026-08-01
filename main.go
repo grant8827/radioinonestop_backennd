@@ -522,6 +522,24 @@ func initDB(dsn string) error {
 		return err
 	}
 	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS pending_registrations (
+			email          TEXT PRIMARY KEY,
+			password_hash  TEXT NOT NULL,
+			first_name     TEXT NOT NULL DEFAULT '',
+			last_name      TEXT NOT NULL DEFAULT '',
+			station_name   TEXT NOT NULL DEFAULT '',
+			logo_url       TEXT NOT NULL DEFAULT '',
+			genre          TEXT NOT NULL DEFAULT '',
+			description    TEXT NOT NULL DEFAULT '',
+			otp_code       TEXT NOT NULL,
+			otp_expires_at TEXT NOT NULL,
+			created_at     TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS support_messages (
 			id TEXT PRIMARY KEY,
 			email TEXT NOT NULL,
@@ -677,6 +695,21 @@ func initDB(dsn string) error {
 		`UPDATE users SET is_email_verified = true WHERE otp_code = '' AND is_email_verified = false`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires_at TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err = db.Exec(migration); err != nil {
+			return err
+		}
+	}
+	for _, migration := range []string{
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS station_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS logo_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS genre TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS otp_code TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS otp_expires_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err = db.Exec(migration); err != nil {
 			return err
@@ -1838,9 +1871,14 @@ func generateStationSlug(stationName, email string) string {
 // ensureStation creates a station row for the user if one does not already exist.
 // It is idempotent and safe to call on every login / credential fetch.
 // stationName and logoURL are stored only on initial creation; pass "" on login paths.
-func ensureStation(userID, email, stationName, logoURL string) (string, error) {
+type sqlQueryExec interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func ensureStationWithDB(q sqlQueryExec, userID, email, stationName, logoURL string) (string, error) {
 	var slug string
-	err := db.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&slug)
+	err := q.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&slug)
 	if err == nil {
 		return slug, nil
 	}
@@ -1856,7 +1894,7 @@ func ensureStation(userID, email, stationName, logoURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_, err = db.Exec(
+	_, err = q.Exec(
 		`INSERT INTO stations (id, user_id, station_slug, station_name, logo_url, is_live, current_listeners_count, source_password)
 		 VALUES ($1, $2, $3, $4, $5, false, 0, $6)
 		 ON CONFLICT DO NOTHING`,
@@ -1866,6 +1904,10 @@ func ensureStation(userID, email, stationName, logoURL string) (string, error) {
 		return "", err
 	}
 	return slug, nil
+}
+
+func ensureStation(userID, email, stationName, logoURL string) (string, error) {
+	return ensureStationWithDB(db, userID, email, stationName, logoURL)
 }
 
 // jwtSign creates a signed JWT for the given user (30-day expiry).
@@ -2051,6 +2093,125 @@ func generateOTP() (string, error) {
 	return fmt.Sprintf("%06d", n), nil
 }
 
+type pendingRegistration struct {
+	Email        string
+	PasswordHash string
+	FirstName    string
+	LastName     string
+	StationName  string
+	LogoURL      string
+	Genre        string
+	Description  string
+	OTPCode      string
+	OTPExpiresAt string
+}
+
+func upsertPendingRegistration(p pendingRegistration) error {
+	_, err := db.Exec(
+		`INSERT INTO pending_registrations (email, password_hash, first_name, last_name, station_name, logo_url, genre, description, otp_code, otp_expires_at, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		 ON CONFLICT (email) DO UPDATE SET
+		     password_hash = EXCLUDED.password_hash,
+		     first_name = EXCLUDED.first_name,
+		     last_name = EXCLUDED.last_name,
+		     station_name = EXCLUDED.station_name,
+		     logo_url = EXCLUDED.logo_url,
+		     genre = EXCLUDED.genre,
+		     description = EXCLUDED.description,
+		     otp_code = EXCLUDED.otp_code,
+		     otp_expires_at = EXCLUDED.otp_expires_at`,
+		p.Email, p.PasswordHash, p.FirstName, p.LastName, p.StationName, p.LogoURL, p.Genre, p.Description, p.OTPCode, p.OTPExpiresAt, time.Now().UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+func createVerifiedUserFromPending(ctx context.Context, p pendingRegistration) (string, string, string, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer tx.Rollback()
+
+	var userID, streamKey, role string
+	var alreadyVerified bool
+	err = tx.QueryRow(`SELECT id, stream_key, role, is_email_verified FROM users WHERE email = $1 FOR UPDATE`, p.Email).
+		Scan(&userID, &streamKey, &role, &alreadyVerified)
+	switch {
+	case err == nil:
+		if alreadyVerified {
+			return "", "", "", fmt.Errorf("email already registered")
+		}
+		if streamKey == "" {
+			streamKey, err = generateKey()
+			if err != nil {
+				return "", "", "", err
+			}
+		}
+		if role == "" {
+			role = "user"
+		}
+		_, err = tx.Exec(
+			`UPDATE users
+			    SET password_hash = $1,
+			        stream_key = $2,
+			        first_name = $3,
+			        last_name = $4,
+			        is_email_verified = true,
+			        otp_code = '',
+			        otp_expires_at = ''
+			  WHERE id = $5`,
+			p.PasswordHash, streamKey, p.FirstName, p.LastName, userID,
+		)
+		if err != nil {
+			return "", "", "", err
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		userID, err = generateKey()
+		if err != nil {
+			return "", "", "", err
+		}
+		streamKey, err = generateKey()
+		if err != nil {
+			return "", "", "", err
+		}
+		_, err = tx.Exec(
+			`INSERT INTO users (id, email, password_hash, stream_key, first_name, last_name, role, created_at, otp_code, otp_expires_at, is_email_verified)
+			 VALUES ($1, $2, $3, $4, $5, $6, 'user', $7, '', '', true)`,
+			userID, p.Email, p.PasswordHash, streamKey, p.FirstName, p.LastName, time.Now().UTC().Format(time.RFC3339),
+		)
+		if err != nil {
+			return "", "", "", err
+		}
+	default:
+		return "", "", "", err
+	}
+
+	stationSlug, err := ensureStationWithDB(tx, userID, p.Email, p.StationName, p.LogoURL)
+	if err != nil {
+		return "", "", "", err
+	}
+	_, err = tx.Exec(
+		`UPDATE stations
+		    SET is_suspended = true,
+		        genre = $1,
+		        description = $2,
+		        station_name = CASE WHEN $3 <> '' THEN $3 ELSE station_name END,
+		        logo_url = CASE WHEN $4 <> '' THEN $4 ELSE logo_url END
+		  WHERE user_id = $5`,
+		p.Genre, p.Description, p.StationName, p.LogoURL, userID,
+	)
+	if err != nil {
+		return "", "", "", err
+	}
+	if _, err = tx.Exec(`DELETE FROM pending_registrations WHERE email = $1`, p.Email); err != nil {
+		return "", "", "", err
+	}
+	if err = tx.Commit(); err != nil {
+		return "", "", "", err
+	}
+	return userID, streamKey, stationSlug, nil
+}
+
 // POST /api/auth/register  {"email":"...","password":"...","first_name":"...","last_name":"...","station_name":"...","logo_url":"...","genre":"...","description":"..."}
 func handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2115,7 +2276,19 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		exp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
-		_, _ = db.Exec(`UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE id = $3`, otp, exp, existingID)
+		_, _ = db.Exec(`UPDATE users SET password_hash = $1, first_name = $2, last_name = $3, otp_code = $4, otp_expires_at = $5 WHERE id = $6`, string(hash), body.FirstName, body.LastName, otp, exp, existingID)
+		if body.StationName != "" || body.LogoURL != "" || body.Genre != "" || body.Description != "" {
+			_, _ = ensureStation(existingID, body.Email, body.StationName, body.LogoURL)
+			_, _ = db.Exec(
+				`UPDATE stations
+				    SET genre = $1,
+				        description = $2,
+				        station_name = CASE WHEN $3 <> '' THEN $3 ELSE station_name END,
+				        logo_url = CASE WHEN $4 <> '' THEN $4 ELSE logo_url END
+				  WHERE user_id = $5`,
+				body.Genre, body.Description, body.StationName, body.LogoURL, existingID,
+			)
+		}
 		otpVerifyResetAttempts(body.Email)
 		if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
 			log.Printf("[email] resend OTP to %s: %v", body.Email, err)
@@ -2127,35 +2300,28 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, err := generateKey()
-	if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
-	streamKey, err := generateKey()
-	if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
 	otp, err := generateOTP()
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
 	otpExp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
-	_, err = db.Exec(
-		`INSERT INTO users (id, email, password_hash, stream_key, first_name, last_name, created_at, otp_code, otp_expires_at, is_email_verified) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
-		userID, body.Email, string(hash), streamKey, body.FirstName, body.LastName, time.Now().UTC().Format(time.RFC3339), otp, otpExp,
-	)
+	err = upsertPendingRegistration(pendingRegistration{
+		Email:        body.Email,
+		PasswordHash: string(hash),
+		FirstName:    body.FirstName,
+		LastName:     body.LastName,
+		StationName:  body.StationName,
+		LogoURL:      body.LogoURL,
+		Genre:        body.Genre,
+		Description:  body.Description,
+		OTPCode:      otp,
+		OTPExpiresAt: otpExp,
+	})
 	if err != nil {
 		log.Printf("[auth] register error: %v", err)
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
-	}
-	ensureStation(userID, body.Email, body.StationName, body.LogoURL)
-	_, _ = db.Exec(`UPDATE stations SET is_suspended = true WHERE user_id = $1`, userID)
-	if body.Genre != "" || body.Description != "" {
-		_, _ = db.Exec(`UPDATE stations SET genre = $1, description = $2 WHERE user_id = $3`, body.Genre, body.Description, userID)
 	}
 	if err := sendOTPEmail(body.Email, body.FirstName, otp); err != nil {
 		log.Printf("[email] send OTP to %s: %v", body.Email, err)
@@ -2255,8 +2421,65 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var userID, storedOTP, otpExp, streamKey, firstName, stationName string
+	var pending pendingRegistration
 	err := db.QueryRow(
+		`SELECT email, password_hash, first_name, last_name, station_name, logo_url, genre, description, otp_code, otp_expires_at
+		   FROM pending_registrations
+		  WHERE email = $1`,
+		body.Email,
+	).Scan(&pending.Email, &pending.PasswordHash, &pending.FirstName, &pending.LastName, &pending.StationName, &pending.LogoURL, &pending.Genre, &pending.Description, &pending.OTPCode, &pending.OTPExpiresAt)
+	switch {
+	case err == nil:
+		if pending.OTPCode == "" || pending.OTPCode != body.OTP {
+			http.Error(w, "invalid code", http.StatusUnauthorized)
+			return
+		}
+		exp, _ := time.Parse(time.RFC3339, pending.OTPExpiresAt)
+		if time.Now().UTC().After(exp) {
+			http.Error(w, "code expired", http.StatusUnauthorized)
+			return
+		}
+		otpVerifyResetAttempts(body.Email)
+		userID, streamKey, stationSlug, err := createVerifiedUserFromPending(r.Context(), pending)
+		if err != nil {
+			if err.Error() == "email already registered" {
+				http.Error(w, "email already registered", http.StatusConflict)
+				return
+			}
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		token, err := jwtSign(userID, body.Email, pending.StationName, "user")
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		go func() {
+			if err := sendWelcomeEmail(body.Email, pending.FirstName); err != nil {
+				log.Printf("[email] welcome to %s: %v", body.Email, err)
+			}
+		}()
+		resp := map[string]string{
+			"token":      token,
+			"stream_key": streamKey,
+			"rtmp_url":   rtmpIngestBase + "/" + streamKey,
+		}
+		if stationSlug != "" {
+			resp["station_slug"] = stationSlug
+			resp["listen_url"] = "/listen/" + stationSlug
+			resp["hub_listen_url"] = "/listen/" + stationSlug
+		}
+		resp["icecast_listen_url"] = publicIcecastListenURL(streamKey)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	var userID, storedOTP, otpExp, streamKey, firstName, stationName string
+	err = db.QueryRow(
 		`SELECT u.id, u.otp_code, u.otp_expires_at, u.stream_key, u.first_name,
 		        COALESCE(s.station_name, '') FROM users u
 		 LEFT JOIN stations s ON s.user_id = u.id
@@ -2321,9 +2544,38 @@ func handleResendOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
-	var userID, firstName string
+	var pendingEmail, firstName string
+	err := db.QueryRow(`SELECT email, first_name FROM pending_registrations WHERE email = $1`, body.Email).
+		Scan(&pendingEmail, &firstName)
+	switch {
+	case err == nil:
+		if otpResendRateLimited(body.Email) {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		otp, otpErr := generateOTP()
+		if otpErr != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		exp := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
+		_, _ = db.Exec(`UPDATE pending_registrations SET otp_code = $1, otp_expires_at = $2 WHERE email = $3`, otp, exp, pendingEmail)
+		otpVerifyResetAttempts(body.Email)
+		if err := sendOTPEmail(body.Email, firstName, otp); err != nil {
+			log.Printf("[email] resend OTP to %s: %v", body.Email, err)
+			http.Error(w, "failed to send verification email — please try again", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	var userID string
 	var verified bool
-	err := db.QueryRow(`SELECT id, first_name, is_email_verified FROM users WHERE email = $1`, body.Email).
+	err = db.QueryRow(`SELECT id, first_name, is_email_verified FROM users WHERE email = $1`, body.Email).
 		Scan(&userID, &firstName, &verified)
 	if errors.Is(err, sql.ErrNoRows) || verified {
 		// Always return 200 — don't leak account existence
@@ -4018,6 +4270,8 @@ func handleGetStations(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
 		SELECT user_id, station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
 		FROM stations
+		INNER JOIN users ON users.id = stations.user_id
+		WHERE users.is_email_verified = true
 		ORDER BY is_live DESC, station_name ASC
 	`)
 	if err != nil {
@@ -4072,7 +4326,9 @@ func handleGetStation(w http.ResponseWriter, r *http.Request) {
 	var s Station
 	err := db.QueryRow(`
 		SELECT user_id, station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
-		FROM stations WHERE station_slug = $1
+		FROM stations
+		INNER JOIN users ON users.id = stations.user_id
+		WHERE station_slug = $1 AND users.is_email_verified = true
 	`, slug).Scan(&s.UserID, &s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc, &s.IcecastListenURL)
 	if err != nil {
 		http.Error(w, `{"error":"station not found"}`, http.StatusNotFound)
@@ -4094,7 +4350,12 @@ func handleListen(w http.ResponseWriter, r *http.Request) {
 	// Verify station exists in DB
 	var userID string
 	var isLive bool
-	err := db.QueryRow(`SELECT user_id, is_live FROM stations WHERE station_slug = $1`, slug).Scan(&userID, &isLive)
+	err := db.QueryRow(`
+		SELECT stations.user_id, stations.is_live
+		FROM stations
+		INNER JOIN users ON users.id = stations.user_id
+		WHERE stations.station_slug = $1 AND users.is_email_verified = true
+	`, slug).Scan(&userID, &isLive)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "station not found", http.StatusNotFound)
 		return
