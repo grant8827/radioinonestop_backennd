@@ -3511,12 +3511,17 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// conferenceGuestLimits maps plan name \u2192 max number of guests (excluding host).
-var conferenceGuestLimits = map[string]int{
-	"starter":      2,
-	"professional": 2,
-	"enterprise":   5,
-	"ultimate":     20,
+func conferenceGuestLimitForPlan(plan string) (int, bool) {
+	switch strings.ToLower(strings.TrimSpace(plan)) {
+	case "professional":
+		return 2, true
+	case "enterprise":
+		return 5, true
+	case "ultimate":
+		return 20, true
+	default:
+		return 0, false
+	}
 }
 
 // \u2500\u2500\u2500 Conference WebRTC Signaling \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -3591,14 +3596,20 @@ func handleConferenceSignal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var roomPlan string
+	if dbErr := db.QueryRow(`SELECT plan FROM stations WHERE user_id = $1`, roomID).Scan(&roomPlan); dbErr != nil {
+		roomPlan = "starter"
+	}
+	limit, conferenceEnabled := conferenceGuestLimitForPlan(roomPlan)
+	if isRoomOwner && !conferenceEnabled {
+		http.Error(w, "Conference rooms are available on Professional and above", http.StatusForbidden)
+		return
+	}
+
 	if !isRoomOwner {
-		var plan string
-		if dbErr := db.QueryRow(`SELECT plan FROM stations WHERE user_id = $1`, roomID).Scan(&plan); dbErr != nil {
-			plan = "professional"
-		}
-		limit, ok := conferenceGuestLimits[plan]
-		if !ok {
-			limit = 5
+		if !conferenceEnabled {
+			http.Error(w, "This station's package does not include conference rooms", http.StatusForbidden)
+			return
 		}
 		confRoomsMu.Lock()
 		existing := confRooms[roomID]
