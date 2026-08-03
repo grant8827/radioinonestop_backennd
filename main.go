@@ -3634,13 +3634,43 @@ func handleConferenceSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	confRoomsMu.Unlock()
 
+	var staleHostPeers []*confPeer
 	room.mu.Lock()
+	if isRoomOwner {
+		for id, p := range room.peers {
+			if p.isHost {
+				staleHostPeers = append(staleHostPeers, p)
+				delete(room.peers, id)
+			}
+		}
+	}
 	snapshot := make([]confPeerInfo, 0, len(room.peers))
 	for _, p := range room.peers {
 		snapshot = append(snapshot, confPeerInfo{PeerID: p.id, Username: p.username, IsHost: p.isHost})
 	}
 	room.peers[peerID] = peer
 	room.mu.Unlock()
+
+	if len(staleHostPeers) > 0 {
+		left := confMsg{Type: "peer_left"}
+		room.mu.RLock()
+		remaining := make([]*confPeer, 0, len(room.peers))
+		for _, p := range room.peers {
+			if p.id != peerID {
+				remaining = append(remaining, p)
+			}
+		}
+		room.mu.RUnlock()
+		for _, stale := range staleHostPeers {
+			left.PeerID = stale.id
+			for _, p := range remaining {
+				if p.id != stale.id {
+					p.writeJSON(left)
+				}
+			}
+			stale.conn.Close()
+		}
+	}
 
 	peer.writeJSON(confMsg{Type: "joined", PeerID: peerID, IsHost: isRoomOwner, Peers: snapshot})
 
