@@ -124,11 +124,13 @@ func newStreamManager() *streamManager {
 }
 
 // start launches an FFmpeg transcode for the given stream key.
-// If a session already exists for that key it is stopped first.
-func (sm *streamManager) start(key string, rtmpConn net.Conn, destinations []string) {
+// If a session already exists for that key we reject the new publisher so the
+// active broadcaster is never replaced implicitly.
+func (sm *streamManager) start(key string, rtmpConn net.Conn, destinations []string) error {
 	sm.mu.Lock()
-	if old, ok := sm.streams[key]; ok {
-		old.cancel()
+	if existing, ok := sm.streams[key]; ok && existing.live.Load() {
+		sm.mu.Unlock()
+		return fmt.Errorf("stream %q is already live", key)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -140,11 +142,15 @@ func (sm *streamManager) start(key string, rtmpConn net.Conn, destinations []str
 	outDir := filepath.Join(HLSDir, key)
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		log.Printf("[stream/%s] mkdir error: %v", key, err)
+		sm.mu.Lock()
+		delete(sm.streams, key)
+		sm.mu.Unlock()
 		cancel()
-		return
+		return err
 	}
 
 	go sm.transcode(ctx, key, outDir, rtmpConn, destinations)
+	return nil
 }
 
 // transcode runs FFmpeg with LL-HLS settings.
@@ -363,7 +369,11 @@ func handleRTMPConn(conn net.Conn, sm *streamManager) {
 	combined := io.MultiReader(strings.NewReader(string(buf[:n])), conn)
 
 	// Wrap back into a net.Conn-like reader the transcode pipeline can use.
-	sm.start(key, &peekedConn{Reader: combined, Conn: conn}, destinations)
+	if err := sm.start(key, &peekedConn{Reader: combined, Conn: conn}, destinations); err != nil {
+		log.Printf("[rtmp/%s] Rejected duplicate publisher: %v", key, err)
+		conn.Close()
+		return
+	}
 }
 
 // peekedConn wraps the re-joined reader with the original net.Conn
@@ -3907,7 +3917,7 @@ type encoderOwnerStore struct {
 	active map[string]bool
 }
 
-var icecastEncoderOwners = &encoderOwnerStore{active: make(map[string]bool)}
+var activeBroadcastOwners = &encoderOwnerStore{active: make(map[string]bool)}
 
 func (s *encoderOwnerStore) acquire(userID string) bool {
 	s.mu.Lock()
@@ -4503,16 +4513,17 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── Hub broadcast mode (no Icecast / FFmpeg required) ─────────────────
+	if !activeBroadcastOwners.acquire(claims.UserID) {
+		log.Printf("[encoder/%s] rejected duplicate broadcast connection", claims.UserID)
+		sendStatus("error", "A stream is already live on another tab or PC. Stop it there before going live here.")
+		return
+	}
+	defer activeBroadcastOwners.release(claims.UserID)
+
 	if cfg.Action == "broadcast" {
 		handleBroadcast(conn, sendStatus, claims.UserID)
 		return
 	}
-	if !icecastEncoderOwners.acquire(claims.UserID) {
-		log.Printf("[encoder/%s] rejected duplicate Icecast encoder connection", claims.UserID)
-		sendStatus("error", "An Icecast encoder is already active in another tab or device")
-		return
-	}
-	defer icecastEncoderOwners.release(claims.UserID)
 
 	// ── Validate and sanitize inputs ───────────────────────────────────────
 	cfg.Host = strings.TrimSpace(cfg.Host)
