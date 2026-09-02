@@ -1134,6 +1134,9 @@ func isAtListenerLimit(userID string) bool {
 
 // Check if user exceeded limit by more than 5 (streaming disabled)
 func isStreamingDisabled(userID string) bool {
+	if stationPublishingDisabled(userID) {
+		return true
+	}
 	plan := getUserPlan(userID)
 	limit := getListenerLimit(plan)
 	current := totalLiveListenerCount(userID)
@@ -2672,8 +2675,8 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request) {
 
 // expireTrialIfNeeded makes an expired unpaid trial use the same account gate
 // as other suspended stations. Paid subscriptions are never expired by this.
-func expireTrialIfNeeded(userID string) {
-	_, _ = db.Exec(`
+func expireTrialIfNeeded(userID string) error {
+	_, err := db.Exec(`
 		UPDATE stations
 		SET is_suspended = true
 		WHERE user_id = $1
@@ -2682,6 +2685,56 @@ func expireTrialIfNeeded(userID string) {
 		  AND COALESCE(paypal_subscription_id, '') = ''
 		  AND COALESCE(stripe_subscription_id, '') = ''
 	`, userID)
+	return err
+}
+
+// stationPublishingDisabled is the single gate used by every source/publisher
+// protocol. Database failures fail closed so a billing outage cannot grant
+// broadcasting access accidentally.
+func stationPublishingDisabled(userID string) bool {
+	if userID == "" {
+		return true
+	}
+	if err := expireTrialIfNeeded(userID); err != nil {
+		log.Printf("[trial] could not expire trial for user %s: %v", userID, err)
+		return true
+	}
+	var suspended bool
+	if err := db.QueryRow(`SELECT COALESCE(is_suspended, false) FROM stations WHERE user_id = $1`, userID).Scan(&suspended); err != nil {
+		log.Printf("[trial] could not check publishing status for user %s: %v", userID, err)
+		return true
+	}
+	return suspended
+}
+
+func expireAllTrials() {
+	result, err := db.Exec(`
+		UPDATE stations
+		SET is_suspended = true
+		WHERE trial_ends_at IS NOT NULL
+		  AND trial_ends_at <= NOW()
+		  AND COALESCE(paypal_subscription_id, '') = ''
+		  AND COALESCE(stripe_subscription_id, '') = ''
+		  AND is_suspended = false
+	`)
+	if err != nil {
+		log.Printf("[trial] expiration sweep failed: %v", err)
+		return
+	}
+	if count, err := result.RowsAffected(); err == nil && count > 0 {
+		log.Printf("[trial] suspended %d expired trial station(s)", count)
+	}
+}
+
+func startTrialExpirationWorker() {
+	expireAllTrials()
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			expireAllTrials()
+		}
+	}()
 }
 
 func ensureStationProfileRow(userID, email, stationName, logoURL string) error {
@@ -2702,7 +2755,7 @@ func handleUserProfile(w http.ResponseWriter, r *http.Request) {
 		if err := ensureStationProfileRow(userID, email, "", ""); err != nil {
 			log.Printf("[profile] ensure station row for user %s failed: %v", userID, err)
 		}
-		expireTrialIfNeeded(userID)
+		_ = expireTrialIfNeeded(userID)
 		var firstName, lastName string
 		_ = db.QueryRow(`SELECT first_name, last_name FROM users WHERE id = $1`, userID).Scan(&firstName, &lastName)
 		var stationName, genre, description, logoURL, stationSlug, plan, billingCycle string
@@ -2988,7 +3041,7 @@ func handleEncoderAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := r.Context().Value(contextKeyUserID).(string)
-	expireTrialIfNeeded(userID)
+	_ = expireTrialIfNeeded(userID)
 	var body struct {
 		Bitrate string `json:"bitrate"`
 	}
@@ -4000,6 +4053,10 @@ func publicIcecastListenURL(streamKey string) string {
 //  2. Also piped into an FFmpeg process that transcodes to HLS (AAC/MPEG-TS)
 //     served at /hls/{slug}/index.m3u8 — works on iOS, Android, and all browsers.
 func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), userID string) {
+	if stationPublishingDisabled(userID) {
+		sendStatus("error", "Your trial has ended. Choose a paid plan to resume broadcasting.")
+		return
+	}
 	var stationSlug string
 	err := db.QueryRow(`SELECT station_slug FROM stations WHERE user_id = $1`, userID).Scan(&stationSlug)
 	if err != nil {
@@ -4088,7 +4145,15 @@ func handleBroadcast(conn *websocket.Conn, sendStatus func(string, string), user
 		log.Printf("[hub/%s] broadcaster disconnected", stationSlug)
 	}()
 
+	lastAccountCheck := time.Now()
 	for {
+		if time.Since(lastAccountCheck) >= 15*time.Second {
+			if stationPublishingDisabled(userID) {
+				sendStatus("error", "Your trial has ended. Choose a paid plan to resume broadcasting.")
+				return
+			}
+			lastAccountCheck = time.Now()
+		}
 		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 		mt, data, err := conn.ReadMessage()
 		conn.SetReadDeadline(time.Time{})
@@ -4167,21 +4232,31 @@ func handleIcecastAuth(w http.ResponseWriter, r *http.Request) {
 
 	// The mount path is the user's stream_key (e.g. /081924935dc8175a4b7d464b72fe652d).
 	// Look up the station whose user has this stream_key and verify source_password.
-	var storedPassword string
+	var storedPassword, userID string
 	err := db.QueryRow(`
-		SELECT st.source_password
+		SELECT st.source_password, st.user_id
 		FROM stations st
 		JOIN users u ON u.id = st.user_id
 		WHERE u.stream_key = $1
-	`, mount).Scan(&storedPassword)
+	`, mount).Scan(&storedPassword, &userID)
 	sharedPass := strings.TrimSpace(os.Getenv("ICECAST_SOURCE_PASSWORD"))
+	// The infrastructure standby source is not associated with a customer.
+	if mount == "__standby" && sharedPass != "" && pass == sharedPass {
+		allow()
+		return
+	}
+	if err != nil || stationPublishingDisabled(userID) {
+		log.Printf("[icecast-auth] denied suspended or unknown mount=/%s", mount)
+		deny()
+		return
+	}
 	if sharedPass != "" && pass == sharedPass {
 		log.Printf("[icecast-auth] allowed mount=/%s (shared secret)", mount)
 		allow()
 		return
 	}
 
-	if err != nil || storedPassword == "" || storedPassword != pass {
+	if storedPassword == "" || storedPassword != pass {
 		log.Printf("[icecast-auth] denied mount=/%s", mount)
 		deny()
 		return
@@ -4445,6 +4520,10 @@ func handleEncoderWS(w http.ResponseWriter, r *http.Request) {
 		return jwtSecret, nil
 	}); err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if stationPublishingDisabled(claims.UserID) {
+		http.Error(w, "trial ended; payment required", http.StatusForbidden)
 		return
 	}
 
@@ -8768,6 +8847,7 @@ func main() {
 		log.Fatalf("[db] init error: %v", err)
 	}
 	log.Printf("[db] Connected to PostgreSQL")
+	startTrialExpirationWorker()
 
 	// Do not clear station live state here. Browser encoders can run on the
 	// dedicated DigitalOcean worker and must survive Railway API redeploys.
@@ -8896,7 +8976,6 @@ func main() {
 	// Uploads static file handler (serves /uploads/ads/<filename>)
 	uploadsFS := http.FileServer(http.Dir("./uploads"))
 	mux.Handle("/uploads/", http.StripPrefix("/uploads/", uploadsFS))
-
 
 	log.Printf("[http] Listening on :%s  (HLS dir: %s)", port, HLSDir)
 	log.Printf("[http] RTMP ingest: rtmp://localhost:%s/live/<streamKey>", RTMPPort)
