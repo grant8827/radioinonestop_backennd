@@ -64,7 +64,7 @@ import (
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 // allowedOrigins is the set of frontend origins permitted to make
-// cross-origin API calls and open the chat/encoder/conference WebSockets.
+// cross-origin API calls and open the encoder/conference WebSockets.
 // Configure via the comma-separated ALLOWED_ORIGINS env var; falls back to
 // the production frontend domain if unset.
 var allowedOrigins = parseAllowedOrigins(os.Getenv("ALLOWED_ORIGINS"))
@@ -420,43 +420,6 @@ func sanitizeKey(s string) string {
 	return b.String()
 }
 
-// ─── Chat hub ─────────────────────────────────────────────────────────────────
-
-// ChatMessage is the payload exchanged over WebSocket.
-type ChatMessage struct {
-	Type    string `json:"type"`
-	User    string `json:"user"`
-	Message string `json:"message"`
-	Time    string `json:"time"`
-}
-
-type chatHub struct {
-	clients   map[*websocket.Conn]bool
-	mu        sync.Mutex
-	broadcast chan ChatMessage
-}
-
-var hub = &chatHub{
-	clients:   make(map[*websocket.Conn]bool),
-	broadcast: make(chan ChatMessage, 256),
-}
-
-func (h *chatHub) run() {
-	for msg := range h.broadcast {
-		h.mu.Lock()
-		for conn := range h.clients {
-			if err := conn.WriteJSON(msg); err != nil {
-				conn.Close()
-				delete(h.clients, conn)
-			}
-		}
-		h.mu.Unlock()
-	}
-}
-
-func (h *chatHub) register(c *websocket.Conn)   { h.mu.Lock(); h.clients[c] = true; h.mu.Unlock() }
-func (h *chatHub) unregister(c *websocket.Conn) { h.mu.Lock(); delete(h.clients, c); h.mu.Unlock() }
-
 // ─── Global state ─────────────────────────────────────────────────────────────
 
 var (
@@ -805,7 +768,7 @@ func initDB(dsn string) error {
 				('professional', 'Professional', jsonb_build_array(
 					'Everything in Starter',
 					'96 or 128 kbps audio streaming',
-					'Conference live-chat rooms',
+					'Conference rooms',
 					'Up to 10 participants',
 					'Priority audio processing',
 					'Up to 1000 concurrent listeners'
@@ -3864,42 +3827,6 @@ func handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int64{"viewers": atomic.LoadInt64(&viewerCount)})
-}
-
-func handleChat(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("[ws] upgrade:", err)
-		return
-	}
-	hub.register(conn)
-	defer func() {
-		hub.unregister(conn)
-		conn.Close()
-	}()
-
-	conn.SetReadLimit(512)
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
-
-	for {
-		var msg ChatMessage
-		if err := conn.ReadJSON(&msg); err != nil {
-			break
-		}
-		msg.Time = time.Now().Format("15:04")
-		msg.Type = "message"
-		if len(msg.Message) > 256 {
-			msg.Message = msg.Message[:256]
-		}
-		if len(msg.User) > 32 {
-			msg.User = msg.User[:32]
-		}
-		hub.broadcast <- msg
-	}
 }
 
 // ─── Browser audio encoder WebSocket ─────────────────────────────────────────
@@ -8900,7 +8827,6 @@ func main() {
 	mux.HandleFunc("/api/streams/status", handleStreamStatus)
 	mux.HandleFunc("/api/viewers", handleViewers)
 	mux.HandleFunc("/api/viewers/heartbeat", handleHeartbeat)
-	mux.HandleFunc("/ws/chat", handleChat)
 	mux.HandleFunc("/api/auth/register", handleRegister)
 	mux.HandleFunc("/api/auth/login", handleLogin)
 	mux.HandleFunc("/api/auth/verify-otp", handleVerifyOTP)
@@ -8971,7 +8897,6 @@ func main() {
 	uploadsFS := http.FileServer(http.Dir("./uploads"))
 	mux.Handle("/uploads/", http.StripPrefix("/uploads/", uploadsFS))
 
-	go hub.run()
 
 	log.Printf("[http] Listening on :%s  (HLS dir: %s)", port, HLSDir)
 	log.Printf("[http] RTMP ingest: rtmp://localhost:%s/live/<streamKey>", RTMPPort)
