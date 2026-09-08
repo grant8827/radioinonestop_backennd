@@ -6773,9 +6773,9 @@ func handleAdminUserDelete(w http.ResponseWriter, r *http.Request, userID string
 		return
 	}
 
-	var passwordHash, role, email string
-	err := db.QueryRow(`SELECT password_hash, role, email FROM users WHERE id = $1`, userID).
-		Scan(&passwordHash, &role, &email)
+	var role, email string
+	err := db.QueryRow(`SELECT role, email FROM users WHERE id = $1`, userID).
+		Scan(&role, &email)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
@@ -6788,8 +6788,13 @@ func handleAdminUserDelete(w http.ResponseWriter, r *http.Request, userID string
 		http.Error(w, "admin accounts cannot be deleted here", http.StatusForbidden)
 		return
 	}
-	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(body.Password)) != nil {
-		http.Error(w, "incorrect account password", http.StatusForbidden)
+	var adminPasswordHash string
+	if err = db.QueryRow(`SELECT password_hash FROM users WHERE id = $1`, adminUserID).Scan(&adminPasswordHash); err != nil {
+		http.Error(w, "could not verify super user", http.StatusInternalServerError)
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(adminPasswordHash), []byte(body.Password)) != nil {
+		http.Error(w, "incorrect super user password", http.StatusForbidden)
 		return
 	}
 
