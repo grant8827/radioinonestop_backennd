@@ -6678,6 +6678,7 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 		Plan         string `json:"plan"`
 		BillingCycle string `json:"billingCycle"`
 		IsSuspended  *bool  `json:"isSuspended"`
+		EndTrial     bool   `json:"endTrial"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -6721,12 +6722,18 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update station plan and suspension status
+	// Activating through the admin action permanently ends/removes any trial.
+	// Keeping this explicit avoids ending a trial during an ordinary profile edit.
 	_, err := db.Exec(`
 		UPDATE stations 
-		SET plan = $1, billing_cycle = $2, is_suspended = $3
-		WHERE user_id = $4
-	`, body.Plan, body.BillingCycle, isSuspended, userID)
+		SET plan = $1,
+		    billing_cycle = $2,
+		    is_suspended = $3,
+		    trial_used = CASE WHEN $4 THEN true ELSE trial_used END,
+		    trial_started_at = CASE WHEN $4 THEN NULL ELSE trial_started_at END,
+		    trial_ends_at = CASE WHEN $4 THEN NULL ELSE trial_ends_at END
+		WHERE user_id = $5
+	`, body.Plan, body.BillingCycle, isSuspended, body.EndTrial, userID)
 
 	if err != nil {
 		log.Printf("[admin] Error updating user: %v", err)
