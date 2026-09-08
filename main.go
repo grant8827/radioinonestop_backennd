@@ -4353,6 +4353,7 @@ func handleGetStations(w http.ResponseWriter, r *http.Request) {
 		FROM stations
 		INNER JOIN users ON users.id = stations.user_id
 		WHERE users.is_email_verified = true
+		  AND BTRIM(stations.station_name) <> ''
 		ORDER BY is_live DESC, station_name ASC
 	`)
 	if err != nil {
@@ -4409,7 +4410,9 @@ func handleGetStation(w http.ResponseWriter, r *http.Request) {
 		SELECT user_id, station_slug, station_name, logo_url, is_live, current_listeners_count, genre, description, icecast_listen_url
 		FROM stations
 		INNER JOIN users ON users.id = stations.user_id
-		WHERE station_slug = $1 AND users.is_email_verified = true
+		WHERE station_slug = $1
+		  AND users.is_email_verified = true
+		  AND BTRIM(stations.station_name) <> ''
 	`, slug).Scan(&s.UserID, &s.Slug, &s.Name, &s.LogoURL, &s.IsLive, &s.Listeners, &s.Genre, &s.Desc, &s.IcecastListenURL)
 	if err != nil {
 		http.Error(w, `{"error":"station not found"}`, http.StatusNotFound)
@@ -4435,7 +4438,9 @@ func handleListen(w http.ResponseWriter, r *http.Request) {
 		SELECT stations.user_id, stations.is_live
 		FROM stations
 		INNER JOIN users ON users.id = stations.user_id
-		WHERE stations.station_slug = $1 AND users.is_email_verified = true
+		WHERE stations.station_slug = $1
+		  AND users.is_email_verified = true
+		  AND BTRIM(stations.station_name) <> ''
 	`, slug).Scan(&userID, &isLive)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "station not found", http.StatusNotFound)
@@ -6658,9 +6663,10 @@ func getAllUsers(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(users)
 }
 
-// handleAdminUserUpdate - PUT /api/admin/users/:id
+// handleAdminUserUpdate handles updates and password-confirmed deletion for
+// /api/admin/users/:id.
 func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
+	if r.Method != http.MethodPut && r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -6671,6 +6677,10 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 
 	if userID == "" {
 		http.Error(w, "user ID required", http.StatusBadRequest)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		handleAdminUserDelete(w, r, userID)
 		return
 	}
 
@@ -6745,6 +6755,74 @@ func handleAdminUserUpdate(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"message": "User updated successfully",
+	})
+}
+
+func handleAdminUserDelete(w http.ResponseWriter, r *http.Request, userID string) {
+	adminUserID, _ := r.Context().Value(contextKeyUserID).(string)
+	if userID == adminUserID {
+		http.Error(w, "you cannot delete your own admin account", http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Password == "" {
+		http.Error(w, "account password is required", http.StatusBadRequest)
+		return
+	}
+
+	var passwordHash, role, email string
+	err := db.QueryRow(`SELECT password_hash, role, email FROM users WHERE id = $1`, userID).
+		Scan(&passwordHash, &role, &email)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if role == "admin" {
+		http.Error(w, "admin accounts cannot be deleted here", http.StatusForbidden)
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(body.Password)) != nil {
+		http.Error(w, "incorrect account password", http.StatusForbidden)
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// listener_hourly predates the foreign keys used by the other user-owned
+	// tables. Those other records are removed by ON DELETE CASCADE.
+	if _, err = tx.Exec(`DELETE FROM listener_hourly WHERE user_id = $1`, userID); err == nil {
+		_, err = tx.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	}
+	if err != nil {
+		log.Printf("[admin] Error deleting user %s: %v", userID, err)
+		http.Error(w, "failed to delete account", http.StatusInternalServerError)
+		return
+	}
+	if _, err = tx.Exec(`DELETE FROM pending_registrations WHERE email = $1`, email); err != nil {
+		http.Error(w, "failed to delete account", http.StatusInternalServerError)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		http.Error(w, "failed to delete account", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Account deleted successfully",
 	})
 }
 
